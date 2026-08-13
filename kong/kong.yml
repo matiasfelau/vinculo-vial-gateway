@@ -9,5 +9,29 @@
 _format_version: "3.0"
 _transform: true
 
-# Services y Routes se incorporan en las features siguientes.
-services: []
+services:
+  # ── vinculo-vial-identity ──────────────────────────────────────────────────
+  # Servicio de identidad: registro, autenticación y gestión de usuarios.
+  - name: identity-service
+    url: ${IDENTITY_SERVICE_URL}
+    # El registro es una operación no idempotente (crea un usuario): sólo se
+    # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
+    retries: 1
+    connect_timeout: 5000
+    write_timeout: 15000
+    read_timeout: 15000
+    routes:
+      # US-01 — Registro. El body es un sobre HPKE: el Gateway no lo inspecciona
+      # ni lo modifica, sólo lo reenvía.
+      - name: identity-signup
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/signup
+        # La ruta pública y la del upstream son idénticas: no se recorta el path.
+        strip_path: false
+        # El upstream recibe su propio Host, no el del cliente.
+        preserve_host: false
+        protocols:
+          - http
+          - https
