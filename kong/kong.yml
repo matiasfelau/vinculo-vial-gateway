@@ -35,6 +35,13 @@ services:
         protocols:
           - http
           - https
+        plugins:
+          # Seguridad perimetral: sin una atestación válida la request no
+          # alcanza la red interna.
+          - name: app-attestation
+            config:
+              psk: "${APP_ATTESTATION_PSK}"
+              max_age_seconds: ${ATTESTATION_TOKEN_TTL_SECONDS}
 
 # ── Plugins globales ─────────────────────────────────────────────────────────
 # Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
