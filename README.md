@@ -84,6 +84,22 @@ la API real no cambie el contrato:
 }
 ```
 
+## Headers de identidad
+
+`X-User-Hash` lo escribe **exclusivamente el Gateway**, a partir del `sub` de un
+JWT ya verificado: los servicios internos confían en él porque llega por la red
+interna. Por eso el header entrante se descarta en **todas** las rutas —
+incluida `/auth/signup`, que no tiene `token-offloading`— mediante un
+`request-transformer` global. Sin eso, cualquiera podría suplantar a otro
+usuario mandando el header desde afuera.
+
+El orden de plugins que lo hace posible:
+
+```
+rate-limiting (910) → app-attestation (900) → request-transformer (801, descarta
+el header entrante) → token-offloading (790, inyecta el verificado)
+```
+
 ## Contrato de error
 
 Los rechazos generados por los plugins propios comparten una única forma

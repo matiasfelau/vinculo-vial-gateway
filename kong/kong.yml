@@ -89,6 +89,19 @@ consumers:
 # Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
 # Gateway, para toda la plataforma.
 plugins:
+  # Los headers de identidad los escribe exclusivamente el Gateway: los
+  # servicios internos confían en `X-User-Hash` porque llega por la red
+  # interna. Si un cliente lo manda desde afuera y lo dejamos pasar, suplanta
+  # a cualquier usuario. Se descarta en TODAS las rutas, incluidas las que no
+  # tienen `token-offloading` (como signup).
+  # Corre en prioridad 801, después de `app-attestation` (900) y antes de
+  # `token-offloading` (790), que es quien inyecta el valor legítimo.
+  - name: request-transformer
+    config:
+      remove:
+        headers:
+          - X-User-Hash
+
   # Rate limiting perimetral por IP de cliente. Primera línea de defensa contra
   # fuerza bruta y abuso automatizado sobre cualquier endpoint.
   - name: rate-limiting

@@ -13,10 +13,12 @@ local errors = require "vv.errors"
 
 local decode_base64 = ngx.decode_base64
 
--- Prioridad 890: después del plugin `jwt` (1450), que es quien verifica la
--- firma y deja el token validado en `ngx.ctx`, y después de `app-attestation`
--- (900).
-local PRIORITY = 890
+-- Prioridad 790: corre después del plugin `jwt` (1450), que es quien verifica
+-- la firma y deja el token validado en `ngx.ctx`, después de `app-attestation`
+-- (900) y —clave— después del `request-transformer` global (801) que descarta
+-- el `X-User-Hash` entrante. Si corriera antes, ese plugin borraría el header
+-- que este acaba de escribir.
+local PRIORITY = 790
 
 -- Un identificador de usuario no tiene por qué ser largo; el techo evita que
 -- un token raro genere un header desmedido.
@@ -98,8 +100,10 @@ function TokenOffloading:access(conf)
   -- lo pueda inyectar desde afuera. Sólo lo escribe este plugin.
   kong.service.request.clear_header(conf.header_name)
 
-  -- El plugin `jwt` deja acá el token ya verificado.
-  local token = ngx.ctx.authenticated_jwt_token
+  -- El plugin `jwt` deja acá el token ya verificado. Desde Kong 3.x lo publica
+  -- en `kong.ctx.shared`; el fallback a `ngx.ctx` cubre versiones anteriores.
+  local token = kong.ctx.shared.authenticated_jwt_token
+    or ngx.ctx.authenticated_jwt_token
 
   local value, reason = TokenOffloading.extract_claim(token, conf.claim)
   if not value then
