@@ -11,6 +11,7 @@
 local cjson = require "cjson.safe"
 local openssl_hmac = require "resty.openssl.hmac"
 local bit = require "bit"
+local errors = require "vv.errors"
 
 local byte = string.byte
 local bxor = bit.bxor
@@ -24,15 +25,6 @@ local PRIORITY = 900
 
 -- Techo defensivo: un JWT de atestación legítimo pesa unos cientos de bytes.
 local MAX_TOKEN_LENGTH = 4096
-
--- Contrato de rechazo: siempre el mismo body, sin detalle interno. El motivo
--- real queda en los logs, no en la respuesta.
-local FORBIDDEN_STATUS = 403
-local FORBIDDEN_BODY = {
-  error = "forbidden",
-  reason = "invalid_attestation",
-}
-local JSON_HEADERS = { ["Content-Type"] = "application/json; charset=utf-8" }
 
 local AppAttestation = {
   PRIORITY = PRIORITY,
@@ -251,9 +243,10 @@ function AppAttestation:access(conf)
 
   local ok, reason = AppAttestation.validate_token(token, conf)
   if not ok then
-    -- Se loguea el motivo, nunca el token ni la PSK.
-    kong.log.warn("app-attestation: request rechazado (", reason, ")")
-    return kong.response.exit(FORBIDDEN_STATUS, FORBIDDEN_BODY, JSON_HEADERS)
+    -- El motivo interno va al log; la respuesta es siempre la misma. Nunca se
+    -- loguea el token ni la PSK.
+    return errors.exit(errors.INVALID_ATTESTATION,
+                       "app-attestation: request rechazado (" .. reason .. ")")
   end
 
   -- El token cumplió su función en el perímetro; no se propaga hacia adentro.

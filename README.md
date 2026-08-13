@@ -28,6 +28,7 @@ kong/
   kong.yml                     # configuración declarativa (Services, Routes, Plugins) — plantilla
   plugins/app-attestation/     # plugin Lua: validación del Mock App Attestation
   plugins/token-offloading/    # plugin Lua: X-User-Hash a partir del JWT verificado
+  lib/vv/errors.lua            # contrato de error compartido por los plugins
 docker/entrypoint.sh           # renderiza kong.yml contra el entorno y delega en Kong
 spec/                          # tests Busted de los plugins Lua
 Dockerfile                     # imagen del Gateway (extiende kong:3.7)
@@ -83,13 +84,29 @@ la API real no cambie el contrato:
 }
 ```
 
-Cualquier rechazo devuelve siempre la misma respuesta, sin filtrar el motivo
-interno (que queda en los logs):
+## Contrato de error
 
-```
-HTTP/1.1 403 Forbidden
+Los rechazos generados por los plugins propios comparten una única forma
+(`kong/lib/vv/errors.lua`):
+
+```json
 { "error": "forbidden", "reason": "invalid_attestation" }
 ```
+
+| Situación | Status | `error` | `reason` |
+|---|---|---|---|
+| Atestación ausente, mal formada, con firma inválida, expirada o con veredicto rechazado | `403` | `forbidden` | `invalid_attestation` |
+| JWT de sesión del que no se puede derivar identidad | `401` | `unauthorized` | `invalid_token` |
+
+El motivo real (`invalid_signature`, `expired_token`, `device_verdict_rejected`,
+…) va **sólo al log**: distinguirlos en la respuesta le diría a quien está
+sondeando el control exactamente qué validación tocó. Nunca se loguea el token
+ni la PSK.
+
+> Los rechazos que produce el propio Kong (`429` de rate limiting, `401` del
+> plugin `jwt`, `404` sin Route, `502/503` del upstream) conservan su formato
+> nativo `{"message": "..."}`. Unificarlos requeriría reescribir las respuestas
+> de error de Kong y queda fuera del alcance de US-01.
 
 ## Convenciones
 
