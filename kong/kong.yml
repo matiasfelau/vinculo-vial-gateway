@@ -43,6 +43,48 @@ services:
               psk: "${APP_ATTESTATION_PSK}"
               max_age_seconds: ${ATTESTATION_TOKEN_TTL_SECONDS}
 
+      # ── Scaffolding de Token Offloading ──────────────────────────────────
+      # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
+      # armado: no aplica a US-01 (en signup todavía no hay token). El par
+      # `jwt` + `token-offloading` es el que se replica en cada endpoint
+      # autenticado de la plataforma.
+      - name: identity-profile
+        methods:
+          - GET
+        paths:
+          - /api/v1/users/me
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Verifica la firma RS256 contra la clave pública de Identity.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          # Traduce el `sub` ya validado a `X-User-Hash` y quita el
+          # `Authorization` antes de reenviar.
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Hash
+              remove_authorization: true
+
+# ── Consumers ────────────────────────────────────────────────────────────────
+# En este modelo el emisor de los tokens es Identity, no cada usuario final: el
+# Gateway sólo necesita la clave pública para verificar la firma, y la
+# identidad del usuario viaja en el claim `sub`.
+consumers:
+  - username: vinculo-vial-identity
+    jwt_secrets:
+      - key: ${JWT_ISSUER}
+        algorithm: RS256
+        rsa_public_key: "${JWT_PUBLIC_KEY}"
+
 # ── Plugins globales ─────────────────────────────────────────────────────────
 # Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
 # Gateway, para toda la plataforma.

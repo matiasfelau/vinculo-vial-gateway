@@ -17,7 +17,7 @@ nunca se inspecciona ni se modifica: viaja cifrado extremo a extremo (HPKE).
 | Ruteo declarativo a `identity-service` | ✅ |
 | Rate limiting global | ✅ |
 | Plugin `app-attestation` (Lua) | ✅ |
-| Token offloading (`X-User-Hash`) | ⏳ |
+| Token offloading (`X-User-Hash`) | ✅ |
 | Imagen Docker + compose | ⏳ |
 
 ## Estructura
@@ -27,6 +27,7 @@ kong/
   kong.conf                    # configuración de la instancia (DB-less, listeners, logging)
   kong.yml                     # configuración declarativa (Services, Routes, Plugins) — plantilla
   plugins/app-attestation/     # plugin Lua: validación del Mock App Attestation
+  plugins/token-offloading/    # plugin Lua: X-User-Hash a partir del JWT verificado
 spec/                          # tests Busted de los plugins Lua
 Dockerfile.test                # imagen de test (Kong + Busted sobre resty)
 ```
