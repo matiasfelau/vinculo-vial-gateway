@@ -1,0 +1,12 @@
+# Todo lo que consume un contenedor Linux (scripts, Lua, config de Kong) debe
+# quedar con finales de línea LF aunque se edite desde Windows: un CRLF en el
+# entrypoint rompe el arranque del contenedor.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.lua   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.conf  text eol=lf
+Dockerfile*  text eol=lf
+.env.example text eol=lf

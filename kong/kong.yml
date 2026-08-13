@@ -1,0 +1,13 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuración declarativa de Kong (modo DB-less).
+#
+# Este archivo es una plantilla: los placeholders ${VARIABLE} se resuelven en
+# el arranque del contenedor (docker/entrypoint.sh) contra las variables de
+# entorno, y el resultado se escribe en `declarative_config` (kong.conf).
+# Nunca se versionan secretos acá.
+# ─────────────────────────────────────────────────────────────────────────────
+_format_version: "3.0"
+_transform: true
+
+# Services y Routes se incorporan en las features siguientes.
+services: []

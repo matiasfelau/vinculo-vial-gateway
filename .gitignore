@@ -1,0 +1,22 @@
+# Secretos: sólo se versiona .env.example
+.env
+.env.*
+!.env.example
+
+# Artefactos de Kong / OpenResty
+*.log
+servroot/
+kong.rendered.yml
+kong.declarative.yml
+
+# Herramientas locales
+.luarocks/
+lua_modules/
+luacov.stats.out
+luacov.report.out
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
