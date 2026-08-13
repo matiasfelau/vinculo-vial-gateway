@@ -89,6 +89,18 @@ consumers:
 # Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
 # Gateway, para toda la plataforma.
 plugins:
+  # Identificador de correlación para trazar una operación a través de todos
+  # los componentes: el Gateway lo genera si el cliente no lo trae, Identity lo
+  # propaga a sus logs y al evento `user.created` de RabbitMQ. Sin esto, cruzar
+  # un signup fallido entre los logs de tres repos es adivinanza.
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-Id
+      generator: uuid
+      # Se devuelve también al cliente: si la app reporta un error, el
+      # identificador que ve el usuario es el mismo que está en los logs.
+      echo_downstream: true
+
   # Los headers de identidad los escribe exclusivamente el Gateway: los
   # servicios internos confían en `X-User-Hash` porque llega por la red
   # interna. Si un cliente lo manda desde afuera y lo dejamos pasar, suplanta
