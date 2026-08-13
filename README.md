@@ -43,8 +43,14 @@ docker compose up --build
 ```
 
 - Proxy en `http://localhost:8000` — único punto de entrada público.
-- Admin API en `http://127.0.0.1:8001` — sólo desde el host; la usa el
-  healthcheck del contenedor (`GET /status`).
+- Status API en `http://127.0.0.1:8100` — sólo lectura (`/status`, `/metrics`),
+  sólo desde el host; la usa el healthcheck del contenedor.
+
+La **Admin API está apagada**. En DB-less la configuración es inmutable en
+runtime, así que no cumple ninguna función operativa; lo único que se le pedía
+era el healthcheck, y para eso alcanza el Status API. Apagarla elimina la
+superficie en vez de depender de que quien despliegue se acuerde de no publicar
+el puerto.
 
 El Gateway se conecta a la red Docker `vinculo-vial`, compartida con el resto
 de los componentes: `IDENTITY_SERVICE_URL` apunta al nombre de servicio de
@@ -83,6 +89,26 @@ la API real no cambie el contrato:
   "deviceRecognitionVerdict": ["MEETS_DEVICE_INTEGRITY"]
 }
 ```
+
+## Rate limiting detrás de un proxy
+
+El límite global cuenta **por IP de cliente**. Si el Gateway queda detrás de un
+balanceador o un ingress, la IP del peer es la del balanceador: todo el tráfico
+caería en un único contador y un solo cliente podría agotar la cuota de la
+plataforma entera. En ese caso hay que declarar el proxy en `KONG_TRUSTED_IPS`
+(ej. `10.0.0.0/8`).
+
+Con `KONG_TRUSTED_IPS` vacío (el default, Gateway expuesto directamente) Kong
+**ignora** el `X-Forwarded-For` entrante, de modo que un cliente no puede
+falsear su IP para evadir el límite. Los dos extremos son correctos; lo que
+rompe es tener un proxy adelante y no declararlo.
+
+## Trazabilidad
+
+Un `X-Correlation-Id` (UUID) se genera en el Gateway si el cliente no lo trae,
+viaja al upstream y se devuelve al cliente. Identity debería propagarlo a sus
+logs y al evento `user.created` de RabbitMQ: es lo que permite cruzar una misma
+operación entre los logs de los tres repos.
 
 ## Headers de identidad
 
