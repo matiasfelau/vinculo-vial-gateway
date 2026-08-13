@@ -15,7 +15,7 @@ nunca se inspecciona ni se modifica: viaja cifrado extremo a extremo (HPKE).
 |---|---|
 | Bootstrap DB-less + logging + Admin API | ✅ |
 | Ruteo declarativo a `identity-service` | ✅ |
-| Rate limiting global | ⏳ |
+| Rate limiting global | ✅ |
 | Plugin `app-attestation` (Lua) | ⏳ |
 | Token offloading (`X-User-Hash`) | ⏳ |
 | Imagen Docker + compose | ⏳ |
