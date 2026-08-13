@@ -1,0 +1,14 @@
+-- Configuración de Busted.
+-- `lpath` incluye la raíz del repo para que `kong/plugins/<nombre>/handler.lua`
+-- se resuelva como `require "kong.plugins.<nombre>.handler"`, igual que en Kong.
+return {
+  _all = {
+    lpath = "./?.lua;./?/init.lua",
+  },
+  default = {
+    ROOT = { "spec" },
+    pattern = "_spec%.lua$",
+    output = "utfTerminal",
+    verbose = true,
+  },
+}
