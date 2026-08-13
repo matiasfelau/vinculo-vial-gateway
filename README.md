@@ -18,7 +18,7 @@ nunca se inspecciona ni se modifica: viaja cifrado extremo a extremo (HPKE).
 | Rate limiting global | ✅ |
 | Plugin `app-attestation` (Lua) | ✅ |
 | Token offloading (`X-User-Hash`) | ✅ |
-| Imagen Docker + compose | ⏳ |
+| Imagen Docker + compose | ✅ |
 
 ## Estructura
 
@@ -28,13 +28,31 @@ kong/
   kong.yml                     # configuración declarativa (Services, Routes, Plugins) — plantilla
   plugins/app-attestation/     # plugin Lua: validación del Mock App Attestation
   plugins/token-offloading/    # plugin Lua: X-User-Hash a partir del JWT verificado
+docker/entrypoint.sh           # renderiza kong.yml contra el entorno y delega en Kong
 spec/                          # tests Busted de los plugins Lua
+Dockerfile                     # imagen del Gateway (extiende kong:3.7)
 Dockerfile.test                # imagen de test (Kong + Busted sobre resty)
 ```
 
-## Configuración
+## Puesta en marcha
 
-Copiar `.env.example` a `.env` y completar. `.env` no se versiona.
+```bash
+cp .env.example .env      # completar, sobre todo APP_ATTESTATION_PSK
+docker compose up --build
+```
+
+- Proxy en `http://localhost:8000` — único punto de entrada público.
+- Admin API en `http://127.0.0.1:8001` — sólo desde el host; la usa el
+  healthcheck del contenedor (`GET /status`).
+
+El Gateway se conecta a la red Docker `vinculo-vial`, compartida con el resto
+de los componentes: `IDENTITY_SERVICE_URL` apunta al nombre de servicio de
+`vinculo-vial-identity` dentro de esa red.
+
+El `kong.yml` versionado es una **plantilla**: el entrypoint resuelve los
+`${VARIABLE}` contra el entorno en cada arranque, valida el resultado con
+`kong config parse` y recién ahí levanta Kong. Si falta una variable requerida,
+el contenedor falla de entrada con el nombre de la que falta (nunca su valor).
 
 ## Tests
 
