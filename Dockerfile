@@ -19,6 +19,9 @@ RUN apt-get update \
 # /opt/kong/kong/plugins/<nombre>/handler.lua → kong.plugins.<nombre>.handler
 COPY kong/plugins/ /opt/kong/kong/plugins/
 
+# Módulos compartidos entre plugins (`vv.*`), fuera del namespace de Kong.
+COPY kong/lib/ /opt/kong/
+
 # Configuración de la instancia y plantilla declarativa. El `.template` se
 # renderiza en cada arranque contra las variables de entorno.
 COPY kong/kong.conf /etc/kong/kong.conf

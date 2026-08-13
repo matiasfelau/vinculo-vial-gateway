@@ -3,7 +3,9 @@
 -- se resuelva como `require "kong.plugins.<nombre>.handler"`, igual que en Kong.
 return {
   _all = {
-    lpath = "./?.lua;./?/init.lua",
+    -- `./kong/lib/?.lua` refleja el layout de la imagen, donde ese directorio
+    -- se copia a la raíz de `KONG_LUA_PACKAGE_PATH` (`require "vv.errors"`).
+    lpath = "./?.lua;./?/init.lua;./kong/lib/?.lua",
   },
   default = {
     ROOT = { "spec" },

@@ -9,6 +9,7 @@
 -- Como en `app-attestation`, la extracción del claim es una función pura y
 -- testeable; el handler sólo la conecta con el request.
 local cjson = require "cjson.safe"
+local errors = require "vv.errors"
 
 local decode_base64 = ngx.decode_base64
 
@@ -20,13 +21,6 @@ local PRIORITY = 890
 -- Un identificador de usuario no tiene por qué ser largo; el techo evita que
 -- un token raro genere un header desmedido.
 local MAX_CLAIM_LENGTH = 256
-
-local UNAUTHORIZED_STATUS = 401
-local UNAUTHORIZED_BODY = {
-  error = "unauthorized",
-  reason = "invalid_token",
-}
-local JSON_HEADERS = { ["Content-Type"] = "application/json; charset=utf-8" }
 
 local TokenOffloading = {
   PRIORITY = PRIORITY,
@@ -109,8 +103,9 @@ function TokenOffloading:access(conf)
 
   local value, reason = TokenOffloading.extract_claim(token, conf.claim)
   if not value then
-    kong.log.warn("token-offloading: no se pudo derivar la identidad (", reason, ")")
-    return kong.response.exit(UNAUTHORIZED_STATUS, UNAUTHORIZED_BODY, JSON_HEADERS)
+    return errors.exit(errors.INVALID_TOKEN,
+                       "token-offloading: no se pudo derivar la identidad ("
+                         .. reason .. ")")
   end
 
   kong.service.request.set_header(conf.header_name, value)

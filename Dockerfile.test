@@ -38,6 +38,7 @@ RUN printf '#!/usr/bin/env bash\nexec resty /app/spec/busted_runner.lua "$@"\n' 
 WORKDIR /app
 COPY .busted ./
 COPY kong/plugins/ ./kong/plugins/
+COPY kong/lib/ ./kong/lib/
 COPY spec/ ./spec/
 
 CMD ["busted", "spec/"]
