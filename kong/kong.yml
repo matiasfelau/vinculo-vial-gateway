@@ -35,3 +35,24 @@ services:
         protocols:
           - http
           - https
+
+# ── Plugins globales ─────────────────────────────────────────────────────────
+# Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
+# Gateway, para toda la plataforma.
+plugins:
+  # Rate limiting perimetral por IP de cliente. Primera línea de defensa contra
+  # fuerza bruta y abuso automatizado sobre cualquier endpoint.
+  - name: rate-limiting
+    config:
+      minute: ${RATE_LIMIT_PER_MINUTE}
+      # `local`: el contador vive en la memoria compartida del nodo. Es la única
+      # política coherente en DB-less mononodo; al escalar horizontalmente se
+      # migra a `redis` sin tocar el resto de la configuración.
+      policy: local
+      limit_by: ip
+      # Si el backend del contador falla, no se corta el tráfico legítimo.
+      fault_tolerant: true
+      # Se exponen los headers RateLimit-* para que la app pueda hacer backoff.
+      hide_client_headers: false
+      error_code: 429
+      error_message: "API rate limit exceeded"
