@@ -133,15 +133,16 @@ docker run --rm --entrypoint sh kong:3.7 -c '
 ' > "${sa_dir}/private.pem"
 chmod 644 "${sa_dir}/private.pem"
 
-# `--user root` para poder escribir el JSON dentro del directorio montado.
-docker run --rm --user root -v "$(to_host_path "${sa_dir}"):/sa" --entrypoint resty kong:3.7 -e '
+# El contenedor sólo lee y escribe a stdout: el archivo lo crea el shell del
+# host, y queda con su usuario y sus permisos. Si lo escribiera el contenedor,
+# quedaría de root y el host no podría ni ajustarle los permisos después.
+docker run --rm -v "$(to_host_path "${sa_dir}"):/sa:ro" --entrypoint resty kong:3.7 -e '
   local cjson = require "cjson.safe"
   local file = assert(io.open("/sa/private.pem"))
   local private_key = file:read("*a")
   file:close()
 
-  local out = assert(io.open("/sa/google-service-account.json", "w"))
-  out:write(cjson.encode({
+  io.write(cjson.encode({
     type = "service_account",
     project_id = "vinculo-vial-test",
     private_key_id = "stub-key-id",
@@ -149,10 +150,7 @@ docker run --rm --user root -v "$(to_host_path "${sa_dir}"):/sa" --entrypoint re
     client_email = "gateway@vinculo-vial-test.iam.gserviceaccount.com",
     token_uri = "http://vv-it-google:8080/token",
   }))
-  out:close()
-'
-
-# Lo escribió root dentro del contenedor; el Gateway lo lee como `kong`.
+' > "${sa_dir}/google-service-account.json"
 chmod 644 "${sa_dir}/google-service-account.json"
 
 echo "==> Levantando el Gateway"
