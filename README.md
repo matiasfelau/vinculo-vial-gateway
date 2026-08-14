@@ -13,27 +13,43 @@ nunca se inspecciona ni se modifica: viaja cifrado extremo a extremo (HPKE).
 
 | Capacidad | Estado |
 |---|---|
-| Bootstrap DB-less + logging + Admin API | ✅ |
+| Bootstrap DB-less + logging + Status API | ✅ |
 | Ruteo declarativo a `identity-service` | ✅ |
 | Rate limiting global | ✅ |
-| Plugin `app-attestation` (Lua) | ✅ |
+| Atestación real contra Google Play Integrity | ✅ |
+| Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | Token offloading (`X-User-Hash`) | ✅ |
 | Imagen Docker + compose | ✅ |
+| CI: 83 tests unitarios + 18 de integración | ✅ |
 
 ## Estructura
 
 ```
 kong/
-  kong.conf                    # configuración de la instancia (DB-less, listeners, logging)
-  kong.yml                     # configuración declarativa (Services, Routes, Plugins) — plantilla
-  plugins/app-attestation/     # plugin Lua: validación del Mock App Attestation
-  plugins/token-offloading/    # plugin Lua: X-User-Hash a partir del JWT verificado
-  lib/vv/errors.lua            # contrato de error compartido por los plugins
-docker/entrypoint.sh           # renderiza kong.yml contra el entorno y delega en Kong
-spec/                          # tests Busted de los plugins Lua
-Dockerfile                     # imagen del Gateway (extiende kong:3.7)
-Dockerfile.test                # imagen de test (Kong + Busted sobre resty)
+  kong.conf                       # instancia: DB-less, listeners, logging, shared dicts
+  kong.yml                        # declarativo: Services, Routes, Plugins — plantilla
+  lib/vv/                         # módulos compartidos (base64url, JWS, errores)
+  plugins/app-attestation/
+    handler.lua                   # orquesta; toda la decisión vive en los módulos
+    schema.lua                    # política y credenciales, nada hardcodeado
+    verdict.lua                   # qué veredictos de Play se aceptan
+    request_hash.lua              # ligadura de la atestación con el body
+    replay_guard.lua              # consumo de un solo uso
+    google_oauth.lua              # service account → access token (cacheado)
+    sources/google.lua            # decodeIntegrityToken (producción)
+    sources/mock.lua              # veredicto firmado con PSK (CI)
+  plugins/token-offloading/       # X-User-Hash a partir del JWT ya verificado
+docker/entrypoint.sh              # renderiza kong.yml contra el entorno
+secrets/                          # credenciales montadas — no se versiona
+spec/                             # tests Busted
+spec/integration/run.sh           # integración contra un stub de Google
+Dockerfile                        # imagen del Gateway (extiende kong:3.7)
+Dockerfile.test                   # imagen de test (Kong + Busted sobre resty)
 ```
+
+La separación entre `verdict.lua` (**qué** se acepta) y `sources/` (**de dónde**
+sale el veredicto) es deliberada: la decisión de seguridad es una sola y se
+testea una sola vez, sirva el veredicto Google o el mock.
 
 ## Puesta en marcha
 
@@ -72,23 +88,75 @@ docker build -f Dockerfile.test -t vinculo-vial-gateway-tests .
 docker run --rm vinculo-vial-gateway-tests            # equivale a `busted spec/`
 ```
 
-## Contrato del header `X-App-Attestation`
+Además hay una suite de **integración** que levanta el Gateway contra un stub de
+las dos APIs de Google y ejercita el camino HTTP completo —firma de la aserción
+del service account, canje por el access token, `decodeIntegrityToken`,
+ligadura con el body y anti-replay— que los tests unitarios no pueden cubrir.
+No necesita credenciales reales:
 
-JWT compacto firmado con **HMAC-SHA256** contra `APP_ATTESTATION_PSK`, emitido
-por la app y validado sólo por el Gateway (Identity nunca lo revisa). Los
-nombres de claim replican los de Play Integrity para que reemplazar el mock por
-la API real no cambie el contrato:
-
-```json
-{
-  "iss": "vinculo-vial-app",
-  "aud": "vinculo-vial-gateway",
-  "iat": 1735689600,
-  "exp": 1735689720,
-  "appRecognitionVerdict": "PLAY_RECOGNIZED",
-  "deviceRecognitionVerdict": ["MEETS_DEVICE_INTEGRITY"]
-}
+```bash
+bash spec/integration/run.sh
 ```
+
+## Atestación: `X-App-Attestation`
+
+El header transporta el **token opaco de Google Play Integrity** que emite el
+dispositivo. El Gateway lo canjea en `decodeIntegrityToken` por el veredicto,
+lo evalúa y recién entonces deja pasar la request. Identity nunca lo ve.
+
+### Lo que tiene que hacer la app
+
+```kotlin
+// 1. El hash del payload EXACTO que se va a enviar, en hexadecimal.
+val body = requestBody.toByteArray()
+val requestHash = MessageDigest.getInstance("SHA-256")
+    .digest(body)
+    .joinToString("") { "%02x".format(it) }
+
+// 2. Pedir el token atándolo a ese hash.
+val token = integrityTokenProvider.request(
+    StandardIntegrityTokenRequest.builder()
+        .setRequestHash(requestHash)
+        .build()
+).await().token()
+
+// 3. Mandarlo junto con ESE body, sin re-serializarlo.
+```
+
+El punto 3 es el que se rompe en la práctica: si el body se vuelve a serializar
+después de hashearlo (otro orden de claves, otro espaciado), el hash deja de
+coincidir y el Gateway responde `403`. Hay que hashear y enviar **los mismos
+bytes**.
+
+El encoding del hash se configura con `ATTESTATION_REQUEST_HASH_ENCODING`
+(`hex` por defecto) y tiene que coincidir exactamente con el del Frontend.
+
+### Lo que valida el Gateway
+
+| Control | Rechaza |
+|---|---|
+| Google resuelve el token | Tokens manipulados, de otra app o vencidos |
+| `requestPackageName` / `packageName` | Tokens emitidos para otra aplicación |
+| `appRecognitionVerdict` | APK no reconocido por Play (modificado, repackaged) |
+| `deviceRecognitionVerdict` | Dispositivos rooteados, emuladores, comprometidos |
+| `certificateSha256Digest` | APK firmado con otro certificado *(opcional)* |
+| `appLicensingVerdict` | Copias no licenciadas *(opcional, off por defecto)* |
+| `timestampMillis` | Atestaciones fuera de la ventana de frescura |
+| `requestHash` vs. body | Una atestación válida reutilizada sobre otro payload |
+| Registro anti-replay | El reenvío de una request idéntica |
+
+El body se **hashea, no se inspecciona**: sigue siendo opaco para el Gateway
+(viaja cifrado E2E y las claves están en Identity) y se reenvía intacto.
+
+### Modo mock
+
+Con `ATTESTATION_SOURCE=mock` el veredicto llega en un JWT firmado con
+`APP_ATTESTATION_PSK` en lugar de pedírselo a Google, con **la misma estructura
+anidada** que devuelve `decodeIntegrityToken`. Existe para CI y para desarrollar
+sin dispositivo físico; la política que se evalúa es idéntica, así que el mock
+no puede pasar por tener una forma más laxa.
+
+Nunca en producción: quien tenga la PSK fabrica cualquier veredicto.
 
 ## Rate limiting detrás de un proxy
 
