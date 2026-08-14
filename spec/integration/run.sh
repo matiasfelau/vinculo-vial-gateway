@@ -120,11 +120,21 @@ docker run -d --name "${UPSTREAM}" --network "${NETWORK}" \
 # `token_uri` apuntando al stub. Nada de esto se versiona.
 echo "==> Generando un service account de prueba"
 sa_dir="$(mktemp -d)"
+
+# Los contenedores de Kong corren como el usuario `kong`, no como root. En
+# Linux el bind mount respeta los permisos del host, y `mktemp -d` crea el
+# directorio en modo 700: sin esto, el contenedor no puede ni entrar.
+# (En Docker Desktop los permisos se ignoran, así que el problema sólo aparece
+# en CI.)
+chmod 755 "${sa_dir}"
+
 docker run --rm --entrypoint sh kong:3.7 -c '
   openssl genrsa 2048 2>/dev/null
 ' > "${sa_dir}/private.pem"
+chmod 644 "${sa_dir}/private.pem"
 
-docker run --rm -v "$(to_host_path "${sa_dir}"):/sa" --entrypoint resty kong:3.7 -e '
+# `--user root` para poder escribir el JSON dentro del directorio montado.
+docker run --rm --user root -v "$(to_host_path "${sa_dir}"):/sa" --entrypoint resty kong:3.7 -e '
   local cjson = require "cjson.safe"
   local file = assert(io.open("/sa/private.pem"))
   local private_key = file:read("*a")
@@ -141,6 +151,9 @@ docker run --rm -v "$(to_host_path "${sa_dir}"):/sa" --entrypoint resty kong:3.7
   }))
   out:close()
 '
+
+# Lo escribió root dentro del contenedor; el Gateway lo lee como `kong`.
+chmod 644 "${sa_dir}/google-service-account.json"
 
 echo "==> Levantando el Gateway"
 docker run -d --name "${GATEWAY}" --network "${NETWORK}" \
