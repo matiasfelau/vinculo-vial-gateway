@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# Credenciales montadas en el contenedor (service account de Google, etc.)
+secrets/
+*.p12
+*-service-account.json
+
 # Artefactos de Kong / OpenResty
 *.log
 servroot/

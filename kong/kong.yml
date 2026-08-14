@@ -36,12 +36,20 @@ services:
           - http
           - https
         plugins:
-          # Seguridad perimetral: sin una atestación válida la request no
-          # alcanza la red interna.
+          # Seguridad perimetral: sin una atestación válida de Play Integrity
+          # la request no alcanza la red interna.
           - name: app-attestation
             config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
               psk: "${APP_ATTESTATION_PSK}"
-              max_age_seconds: ${ATTESTATION_TOKEN_TTL_SECONDS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
 
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón

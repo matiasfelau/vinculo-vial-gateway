@@ -17,6 +17,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      # Credenciales de Google. Se montan como archivo de sólo lectura en vez
+      # de pasarse por entorno: la clave privada del service account no tiene
+      # por qué estar en el ambiente del proceso ni en la config declarativa.
+      # `./secrets` no se versiona; ver .env.example.
+      - ./secrets:/etc/vinculo-vial:ro
     ports:
       # Proxy: único punto de entrada público de la plataforma.
       - "${GATEWAY_PROXY_PORT:-8000}:8000"

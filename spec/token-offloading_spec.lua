@@ -1,14 +1,14 @@
 local handler = require "kong.plugins.token-offloading.handler"
-local jwt = require "spec.helpers.jwt"
+local token_helper = require "spec.helpers.token"
 
--- El plugin nativo `jwt` ya verificó la firma antes de que corra este plugin,
--- así que la PSK del helper es irrelevante: sólo se necesita un JWT bien
--- formado con claims reales.
-local SIGNING_KEY = "irrelevante-para-este-plugin-0123456789"
+-- El plugin nativo `jwt` ya verificó la firma antes de que corra este plugin:
+-- este sólo necesita un JWT bien formado del que extraer la identidad.
+
+
 local USER_HASH = "8f14e45fceea167a5a36dedd4bea2543"
 
 local function token(claims, header_overrides)
-  return jwt.sign(claims, SIGNING_KEY, header_overrides)
+  return token_helper.compact(claims, header_overrides)
 end
 
 describe("token-offloading", function()

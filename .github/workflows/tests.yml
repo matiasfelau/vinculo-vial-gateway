@@ -69,3 +69,16 @@ jobs:
       - name: Logs del Gateway
         if: always()
         run: docker logs gateway-ci 2>&1 | tail -50
+
+  integration:
+    name: Integración (Play Integrity contra stub)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ejercita el camino HTTP completo contra Google —firma de la aserción
+      # del service account, canje por access token, decodeIntegrityToken— que
+      # los tests unitarios no pueden cubrir. Sin credenciales reales: el stub
+      # emula ambos endpoints.
+      - name: Correr la suite de integración
+        run: bash spec/integration/run.sh

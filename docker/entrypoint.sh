@@ -15,8 +15,15 @@ RENDERED="${KONG_DECLARATIVE_CONFIG:-/tmp/kong.declarative.yml}"
 # sustituya sólo éstas: cualquier otro `$` del YAML queda intacto.
 REQUIRED_VARS=(
   IDENTITY_SERVICE_URL
+  ATTESTATION_SOURCE
+  PLAY_PACKAGE_NAME
+  GOOGLE_SERVICE_ACCOUNT_PATH
+  PLAY_INTEGRITY_URL
+  ATTESTATION_SSL_VERIFY
   APP_ATTESTATION_PSK
-  ATTESTATION_TOKEN_TTL_SECONDS
+  ATTESTATION_DEVICE_VERDICTS
+  ATTESTATION_MAX_AGE_SECONDS
+  ATTESTATION_REQUEST_HASH_ENCODING
   RATE_LIMIT_PER_MINUTE
   JWT_ISSUER
   JWT_PUBLIC_KEY
@@ -42,6 +49,16 @@ for var in "${REQUIRED_VARS[@]}"; do
 done
 
 envsubst "${substitutions}" < "${TEMPLATE}" > "${RENDERED}"
+
+# El service account sólo se lee en la primera request, así que una ruta mal
+# puesta se manifestaría como "todo el tráfico rechazado" en producción y no
+# en el arranque. Se avisa acá, sin abortar: `mock` no lo necesita, y un
+# volumen puede montarse después del arranque.
+if [[ "${ATTESTATION_SOURCE}" == "google" && ! -r "${GOOGLE_SERVICE_ACCOUNT_PATH}" ]]; then
+  echo "WARN: ATTESTATION_SOURCE=google pero no se puede leer" >&2
+  echo "      ${GOOGLE_SERVICE_ACCOUNT_PATH}" >&2
+  echo "      Toda atestación va a fallar hasta que el archivo esté montado." >&2
+fi
 
 # Falla temprano y con un mensaje claro si la configuración resultante no es
 # válida, en lugar de dejar que Kong muera a mitad del arranque.
