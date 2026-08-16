@@ -159,6 +159,41 @@ ausente y dejar la identidad sólo en `appIntegrity.packageName`. El criterio es
   (`package_name_absent`), porque sin identidad un token de cualquier otra app
   pasaría.
 
+> **Esta comparación es la que detecta un token de otra app; no es redundante.**
+> Comprobado en producción: `decodeIntegrityToken` devuelve `200` con un
+> veredicto perfectamente válido aunque el package de la URL no sea el de la app
+> que generó el token. Google descifra y devuelve el veredicto, y deja en manos
+> del servidor verificar para qué app se emitió. Sacar este chequeo dejaría
+> pasar atestaciones legítimas de cualquier otra aplicación.
+
+### Veredicto de la app y builds de desarrollo
+
+`appRecognitionVerdict` sólo vale `PLAY_RECOGNIZED` cuando el APK instalado es
+**el que distribuyó Google Play**, firmado con la clave registrada en Play
+Console. Un build compilado desde Android Studio está firmado con el keystore
+de debug, así que Google devuelve `UNRECOGNIZED_VERSION` y el Gateway lo
+rechaza — correctamente.
+
+Para probar de punta a punta con el veredicto real, hay que instalar desde
+Play. Lo más rápido es **Internal App Sharing** (Play Console → *Internal app
+sharing* → subir el APK/AAB → abrir el link desde el dispositivo), que no
+requiere pasar por revisión ni publicar nada.
+
+Para iterar sin subir a Play en cada cambio, se puede aceptar el veredicto de
+desarrollo:
+
+```bash
+ATTESTATION_APP_VERDICTS=["PLAY_RECOGNIZED","UNRECOGNIZED_VERSION"]
+```
+
+Eso **desactiva de hecho la verificación de que la app sea la legítima**: un
+APK modificado o reempaquetado pasaría. Sirve para desarrollo; nunca para
+producción.
+
+> Si el veredicto llega como `UNEVALUATED`, el problema no está en la app:
+> significa que Google no llegó a evaluarla, casi siempre porque el dispositivo
+> no calificó. Hay que mirar `deviceIntegrity`.
+
 ### Diagnóstico
 
 Los rechazos donde "¿qué recibió?" es toda la pregunta —package, veredicto de
@@ -167,8 +202,8 @@ esperaba:
 
 ```
 app-attestation: request rechazado (package_mismatch) —
-  requestDetails.requestPackageName='ar.vinculovial.app.debug',
-  esperado='ar.vinculovial.app'
+  requestDetails.requestPackageName='ar.felaufernandezbottaro.vinculovial.debug',
+  esperado='ar.felaufernandezbottaro.vinculovial'
 
 app-attestation: request rechazado (device_verdict_rejected) —
   recibido=['MEETS_BASIC_INTEGRITY'],

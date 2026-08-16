@@ -11,7 +11,7 @@ local base64url = require "vv.base64url"
 
 local _M = {}
 
-_M.PACKAGE_NAME = "ar.vinculovial.app"
+_M.PACKAGE_NAME = "ar.felaufernandezbottaro.vinculovial"
 
 -- Centinela para *quitar* una clave en los overrides: pasar `nil` no sirve,
 -- porque `pairs` no itera claves ausentes.

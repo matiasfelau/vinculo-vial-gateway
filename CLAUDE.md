@@ -35,6 +35,7 @@ El Gateway es el único punto de entrada público. Para US-01: enruta `POST /api
   - La app debe pedirlo con `setRequestHash(<SHA-256 del body en hex>)`, atándolo al payload exacto que va a enviar. Si el body se re-serializa después de hashearlo, el Gateway responde `403`.
   - El Gateway exige: app reconocida por Play, dispositivo íntegro (`MEETS_DEVICE_INTEGRITY` o `MEETS_STRONG_INTEGRITY`), package name coincidente, atestación fresca, `requestHash` igual al hash del body recibido, y token no reutilizado.
   - El package se verifica contra las dos ubicaciones donde Google lo publica (`requestDetails.requestPackageName` y `appIntegrity.packageName`): todos los valores presentes deben coincidir y debe haber al menos uno. La Standard API no siempre puebla el primero.
+  - **`decodeIntegrityToken` devuelve `200` aunque el token provenga de otra app** (comprobado en producción): Google descifra y entrega el veredicto, y deja en manos del servidor verificar el package. La comparación del Gateway es el único control que detecta ese caso — no es redundante con el status de la API.
   - En `ATTESTATION_SOURCE=mock` (sólo CI/desarrollo) el veredicto viaja en un JWT HS256 firmado con `APP_ATTESTATION_PSK`, con **idéntica estructura anidada** a la respuesta de Google.
 - **Evento RabbitMQ publicado**: `user.created`, producido por `vinculo-vial-identity`.
   ```json
@@ -133,6 +134,7 @@ Rama base `dev`. Una rama por feature, `feature/<slug>`, PR + squash merge a `de
 ## Configuración
 `.env.example` documenta todas las variables. Las principales:
 - **Atestación**: `ATTESTATION_SOURCE` (`google`|`mock`), `PLAY_PACKAGE_NAME`, `GOOGLE_SERVICE_ACCOUNT_PATH`, `ATTESTATION_DEVICE_VERDICTS`, `ATTESTATION_MAX_AGE_SECONDS`, `ATTESTATION_REQUEST_HASH_ENCODING`, `APP_ATTESTATION_PSK` (sólo mock).
+- **Veredictos**: `ATTESTATION_APP_VERDICTS` y `ATTESTATION_DEVICE_VERDICTS`. Un build de Android Studio nunca es `PLAY_RECOGNIZED` (está firmado con el keystore de debug): para probar con el veredicto real hay que instalar desde Play (Internal App Sharing). Aceptar `UNRECOGNIZED_VERSION` desactiva de hecho la verificación de que la app sea legítima — sólo desarrollo.
 - **Tamaño de payload**: `SIGNUP_MAX_BODY_MB` (plugin `request-size-limiting`, por Route). El piso global de nginx (`nginx_http_client_max_body_size`, en `kong.conf`, no templado por env) tiene que ser >= a este valor, o nginx corta antes con su propio 413 y el plugin nunca corre.
 - **Plataforma**: `RATE_LIMIT_PER_MINUTE`, `IDENTITY_SERVICE_URL`, `JWT_PUBLIC_KEY` / `JWT_ISSUER` (Token Offloading), `KONG_TRUSTED_IPS`, puertos de proxy y status.
 
