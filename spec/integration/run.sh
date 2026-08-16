@@ -241,6 +241,35 @@ check "un error 5xx de Google falla cerrado" \
   403 "$(signup_status "BOOM" '{}')"
 
 echo
+echo "Tamaño del payload"
+
+# El plugin `request-size-limiting` corre en prioridad 951: más alto que
+# `app-attestation` (900). Un body por encima de SIGNUP_MAX_BODY_MB tiene que
+# rechazarse SIN llegar a llamar a Google, aunque la atestación ni siquiera
+# sea válida — si el orden estuviera invertido, cada intento de subir un
+# archivo enorme le costaría una llamada real a la Play Integrity API.
+google_calls_before="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+
+# El body en sí no importa (se rechaza antes de leerlo entero); sólo el
+# tamaño. Se arma en un archivo dentro del contenedor para no chocar con el
+# límite de longitud de argumentos del shell del host.
+docker exec "${GATEWAY}" sh -c \
+  "head -c 6291456 /dev/urandom > /tmp/oversized.bin"
+
+oversized_status="$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+  -H 'X-App-Attestation: no-hace-falta-que-sea-valido' \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'Expect:' \
+  --data-binary @/tmp/oversized.bin)"
+
+check "un body de 6MB (> SIGNUP_MAX_BODY_MB) se rechaza" 413 "${oversized_status}"
+
+google_calls_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+check "el rechazo por tamaño no llega a llamar a Google" \
+  "${google_calls_before}" "${google_calls_after}"
+
+echo
 echo "Header de atestación"
 
 check "sin header, 403 sin siquiera llamar a Google" \
