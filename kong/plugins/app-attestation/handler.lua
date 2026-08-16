@@ -31,9 +31,17 @@ local AppAttestation = {
   VERSION = "2.0.0",
 }
 
-local function reject(reason)
-  return errors.exit(errors.INVALID_ATTESTATION,
-                     "app-attestation: request rechazado (" .. reason .. ")")
+-- El motivo va al log; al cliente siempre le llega la misma respuesta. El
+-- `detail` es para el operador: dice qué se recibió frente a qué se esperaba,
+-- que es lo único que permite distinguir una app mal configurada de un ataque.
+local function reject(reason, detail)
+  local message = "app-attestation: request rechazado (" .. reason .. ")"
+
+  if detail then
+    message = message .. " — " .. detail
+  end
+
+  return errors.exit(errors.INVALID_ATTESTATION, message)
 end
 
 function AppAttestation:access(conf)
@@ -93,10 +101,10 @@ function AppAttestation:access(conf)
     end
   end
 
-  local ok, policy_err =
+  local ok, policy_err, policy_detail =
     verdict_policy.evaluate(verdict, conf, body_hash, ngx.now())
   if not ok then
-    return reject(policy_err)
+    return reject(policy_err, policy_detail)
   end
 
   -- El token cumplió su función en el perímetro; no se propaga hacia adentro.

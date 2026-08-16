@@ -136,7 +136,7 @@ El encoding del hash se configura con `ATTESTATION_REQUEST_HASH_ENCODING`
 | Control | Rechaza |
 |---|---|
 | Google resuelve el token | Tokens manipulados, de otra app o vencidos |
-| `requestPackageName` / `packageName` | Tokens emitidos para otra aplicación |
+| `requestPackageName` / `packageName` | Tokens emitidos para otra aplicación (ver abajo) |
 | `appRecognitionVerdict` | APK no reconocido por Play (modificado, repackaged) |
 | `deviceRecognitionVerdict` | Dispositivos rooteados, emuladores, comprometidos |
 | `certificateSha256Digest` | APK firmado con otro certificado *(opcional)* |
@@ -147,6 +147,38 @@ El encoding del hash se configura con `ATTESTATION_REQUEST_HASH_ENCODING`
 
 El body se **hashea, no se inspecciona**: sigue siendo opaco para el Gateway
 (viaja cifrado E2E y las claves están en Identity) y se reenvía intacto.
+
+### Identidad de la app
+
+Google publica el package en dos lugares del veredicto y **no siempre puebla
+los dos**: la Standard API puede devolver `requestDetails.requestPackageName`
+ausente y dejar la identidad sólo en `appIntegrity.packageName`. El criterio es:
+
+- todos los valores presentes tienen que coincidir con `PLAY_PACKAGE_NAME`, y
+- tiene que haber al menos uno — si faltan los dos se rechaza
+  (`package_name_absent`), porque sin identidad un token de cualquier otra app
+  pasaría.
+
+### Diagnóstico
+
+Los rechazos donde "¿qué recibió?" es toda la pregunta —package, veredicto de
+dispositivo y `requestHash`— agregan al **log** qué llegó frente a qué se
+esperaba:
+
+```
+app-attestation: request rechazado (package_mismatch) —
+  requestDetails.requestPackageName='ar.vinculovial.app.debug',
+  esperado='ar.vinculovial.app'
+
+app-attestation: request rechazado (device_verdict_rejected) —
+  recibido=['MEETS_BASIC_INTEGRITY'],
+  aceptados=['MEETS_DEVICE_INTEGRITY', 'MEETS_STRONG_INTEGRITY']
+```
+
+Va **sólo al log**, nunca a la respuesta: el cliente sigue recibiendo el mismo
+`403 {"error":"forbidden","reason":"invalid_attestation"}` en todos los casos.
+Los valores se sanean antes de interpolarse (sin caracteres de control, con
+tope de largo) para que no se pueda inyectar una entrada de log falsa.
 
 ### Modo mock
 

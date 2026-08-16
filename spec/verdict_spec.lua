@@ -88,20 +88,65 @@ describe("política de atestación", function()
   end)
 
   describe("identidad de la app", function()
+    -- Google publica el package en dos lugares y no siempre puebla los dos:
+    -- la Standard API puede omitir `requestDetails.requestPackageName`. El
+    -- criterio es "todos los presentes coinciden y hay al menos uno".
+    it("acepta cuando ambas ubicaciones traen el package correcto", function()
+      assert.is_true(evaluate())
+    end)
+
+    it("acepta si falta requestPackageName pero appIntegrity coincide", function()
+      -- Éste es el caso que rechazaba de más: un veredicto legítimo de la
+      -- Standard API sin `requestDetails.requestPackageName`.
+      assert.is_true(evaluate({
+        requestDetails = { requestPackageName = NONE },
+      }))
+    end)
+
+    it("acepta si falta appIntegrity.packageName pero requestDetails coincide", function()
+      assert.is_true(evaluate({
+        appIntegrity = { packageName = NONE },
+      }))
+    end)
+
     it("rechaza un token emitido para otra aplicación", function()
-      local ok, reason = evaluate({
+      local ok, reason, detail = evaluate({
         requestDetails = { requestPackageName = "com.otra.app" },
       })
       assert.is_nil(ok)
-      assert.equals("request_package_mismatch", reason)
+      assert.equals("package_mismatch", reason)
+      -- El detalle es lo que hace diagnosticable el rechazo desde el log.
+      assert.matches("requestDetails.requestPackageName", detail, 1, true)
+      assert.matches("com.otra.app", detail, 1, true)
+      assert.matches(play.PACKAGE_NAME, detail, 1, true)
     end)
 
-    it("rechaza si el package del veredicto no coincide con el pedido", function()
-      local ok, reason = evaluate({
+    it("rechaza si appIntegrity.packageName no coincide, aunque falte el otro", function()
+      local ok, reason, detail = evaluate({
+        requestDetails = { requestPackageName = NONE },
         appIntegrity = { packageName = "com.otra.app" },
       })
       assert.is_nil(ok)
-      assert.equals("app_package_mismatch", reason)
+      assert.equals("package_mismatch", reason)
+      assert.matches("appIntegrity.packageName", detail, 1, true)
+    end)
+
+    it("rechaza si ninguna de las dos ubicaciones trae el package", function()
+      -- Sin identidad no hay nada que verificar: un token de cualquier otra
+      -- app pasaría.
+      local ok, reason = evaluate({
+        requestDetails = { requestPackageName = NONE },
+        appIntegrity = { packageName = NONE },
+      })
+      assert.is_nil(ok)
+      assert.equals("package_name_absent", reason)
+    end)
+
+    it("no verifica el package si no se configuró ninguno", function()
+      assert.is_true(evaluate({
+        requestDetails = { requestPackageName = NONE },
+        appIntegrity = { packageName = NONE },
+      }, { package_name = NONE }))
     end)
 
     it("rechaza una app no reconocida por Play", function()
@@ -151,11 +196,14 @@ describe("política de atestación", function()
     end)
 
     it("rechaza una lista vacía, que es como Google reporta un dispositivo comprometido", function()
-      local ok, reason = evaluate({
+      local ok, reason, detail = evaluate({
         deviceIntegrity = { deviceRecognitionVerdict = {} },
       })
       assert.is_nil(ok)
       assert.equals("device_verdict_rejected", reason)
+      -- Una lista vacía tiene que distinguirse en el log de un veredicto con
+      -- valores que no están entre los aceptados.
+      assert.matches("recibido=[]", detail, 1, true)
     end)
 
     it("permite aflojar la política por configuración", function()
@@ -202,13 +250,18 @@ describe("política de atestación", function()
     end)
 
     it("rechaza una atestación válida reutilizada sobre otro body", function()
-      local ok, reason = evaluate(
+      local ok, reason, detail = evaluate(
         { requestDetails = { requestHash = BODY_HASH } },
-        { require_request_hash = true },
+        { require_request_hash = true, request_hash_encoding = "hex" },
         "hash-de-un-body-distinto"
       )
       assert.is_nil(ok)
       assert.equals("request_hash_mismatch", reason)
+      -- Con los dos valores y el encoding en el log se distingue "la app
+      -- hasheó otro payload" de "la app usa otro encoding".
+      assert.matches(BODY_HASH, detail, 1, true)
+      assert.matches("hash-de-un-body-distinto", detail, 1, true)
+      assert.matches("hex", detail, 1, true)
     end)
 
     it("acepta `nonce` como alternativa, para el flujo clásico de Play", function()

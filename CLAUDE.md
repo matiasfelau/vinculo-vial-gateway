@@ -34,6 +34,7 @@ El Gateway es el único punto de entrada público. Para US-01: enruta `POST /api
 - **Header `X-App-Attestation`**: token opaco emitido por **Google Play Integrity** en el dispositivo. Lo genera la app, lo canjea y valida el Gateway contra `decodeIntegrityToken`; Identity nunca lo revisa.
   - La app debe pedirlo con `setRequestHash(<SHA-256 del body en hex>)`, atándolo al payload exacto que va a enviar. Si el body se re-serializa después de hashearlo, el Gateway responde `403`.
   - El Gateway exige: app reconocida por Play, dispositivo íntegro (`MEETS_DEVICE_INTEGRITY` o `MEETS_STRONG_INTEGRITY`), package name coincidente, atestación fresca, `requestHash` igual al hash del body recibido, y token no reutilizado.
+  - El package se verifica contra las dos ubicaciones donde Google lo publica (`requestDetails.requestPackageName` y `appIntegrity.packageName`): todos los valores presentes deben coincidir y debe haber al menos uno. La Standard API no siempre puebla el primero.
   - En `ATTESTATION_SOURCE=mock` (sólo CI/desarrollo) el veredicto viaja en un JWT HS256 firmado con `APP_ATTESTATION_PSK`, con **idéntica estructura anidada** a la respuesta de Google.
 - **Evento RabbitMQ publicado**: `user.created`, producido por `vinculo-vial-identity`.
   ```json
@@ -99,6 +100,7 @@ y el motivo real queda sólo en el log.
 ## Convenciones de código (plugins Lua)
 - La lógica decidible va en módulos puros, sin acceso al entorno de request ni al reloj (el `now` se recibe); el `handler.lua` sólo orquesta. Es lo que permite testear con Busted sin levantar Kong.
 - Nunca loguear el token de atestación, la PSK ni la clave privada del service account. Ante un error de Google se reporta el status, no el cuerpo.
+- El criterio de "no filtrar el motivo interno" aplica a la **respuesta HTTP**, no al log: el log es para el operador y debe decir qué se recibió frente a qué se esperaba, o un rechazo no es diagnosticable. Los valores que se interpolan se sanean (sin caracteres de control, con tope de largo).
 - Config del plugin vía `schema.lua` + variables de entorno inyectadas a Kong, nunca hardcodeada en el `.lua`.
 - Comparaciones de firmas y hashes en tiempo constante (`vv.constant_time`).
 

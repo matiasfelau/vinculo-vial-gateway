@@ -59,6 +59,96 @@ local function is_accepted(value, accepted)
   return false
 end
 
+-- Lee un campo sin asumir que el objeto que lo contiene exista.
+local function field_of(container, key)
+  if type(container) ~= "table" then
+    return nil
+  end
+
+  return container[key]
+end
+
+-- Largo máximo de un valor interpolado en el detalle que va al log.
+local MAX_DETAIL_LENGTH = 120
+
+-- Formatea un valor recibido para el log del operador.
+--
+-- Lo que se interpola sale de la respuesta de Google: no es secreto ni PII
+-- (nombres de paquete, veredictos, hashes), pero se sanea igual — un salto de
+-- línea en el valor permitiría inyectar una entrada de log falsa.
+local function describe(value)
+  if value == nil then
+    return "ausente"
+  end
+
+  if type(value) == "table" then
+    local items = {}
+    for _, item in ipairs(value) do
+      items[#items + 1] = describe(item)
+    end
+
+    return "[" .. table.concat(items, ", ") .. "]"
+  end
+
+  local text = (tostring(value):gsub("%c", " "))
+  if #text > MAX_DETAIL_LENGTH then
+    text = text:sub(1, MAX_DETAIL_LENGTH) .. "…"
+  end
+
+  return "'" .. text .. "'"
+end
+
+-- Verifica para qué app se emitió la atestación.
+--
+-- La identidad aparece en hasta dos lugares del veredicto, y Google no siempre
+-- puebla los dos: la Standard API puede omitir
+-- `requestDetails.requestPackageName` y dejar la identidad sólo en
+-- `appIntegrity.packageName`. Exigir el primero rechazaría atestaciones
+-- perfectamente válidas.
+--
+-- El criterio es: TODOS los valores presentes tienen que coincidir, y tiene que
+-- haber al menos uno. Que falten los dos no se puede aceptar — sin ninguno no
+-- hay forma de saber para qué app se emitió la atestación, y un token de
+-- cualquier otra app pasaría.
+local function check_package(verdict, expected)
+  if not expected then
+    return true
+  end
+
+  local sources = {
+    {
+      field = "requestDetails.requestPackageName",
+      value = field_of(verdict.requestDetails, "requestPackageName"),
+    },
+    {
+      field = "appIntegrity.packageName",
+      value = field_of(verdict.appIntegrity, "packageName"),
+    },
+  }
+
+  local found = false
+
+  for _, source in ipairs(sources) do
+    if type(source.value) == "string" and source.value ~= "" then
+      found = true
+
+      if source.value ~= expected then
+        return nil, "package_mismatch",
+          source.field .. "=" .. describe(source.value)
+            .. ", esperado=" .. describe(expected)
+      end
+    end
+  end
+
+  if not found then
+    return nil, "package_name_absent",
+      "el veredicto no trae requestDetails.requestPackageName "
+        .. "ni appIntegrity.packageName"
+  end
+
+  return true
+end
+
 --- Evalúa el veredicto contra la política configurada.
 -- @param verdict table `tokenPayloadExternal`
 -- @param conf table configuración del plugin
@@ -66,6 +156,8 @@ end
 -- @param now number timestamp UNIX en segundos
 -- @return true si la atestación es aceptable
 -- @return nil, string motivo interno del rechazo (para logs, nunca al cliente)
+-- @return string|nil detalle del rechazo para el log: qué se recibió frente a
+--         qué se esperaba. Tampoco sale al cliente.
 function M.evaluate(verdict, conf, body_hash, now)
   if type(verdict) ~= "table" then
     return nil, "malformed_verdict"
@@ -77,9 +169,11 @@ function M.evaluate(verdict, conf, body_hash, now)
     return nil, "missing_request_details"
   end
 
-  if conf.package_name
-    and request_details.requestPackageName ~= conf.package_name then
-    return nil, "request_package_mismatch"
+  -- Identidad de la app: mira las dos ubicaciones posibles a la vez.
+  local package_ok, package_reason, package_detail =
+    check_package(verdict, conf.package_name)
+  if not package_ok then
+    return nil, package_reason, package_detail
   end
 
   -- Google lo emite como string de milisegundos. Es el reloj de Google, no el
@@ -116,7 +210,13 @@ function M.evaluate(verdict, conf, body_hash, now)
     end
 
     if not constant_time.equals(presented, body_hash) then
-      return nil, "request_hash_mismatch"
+      -- El error de integración más frecuente: la app hashea un payload y
+      -- envía otro (re-serializado), o usa otro encoding que el configurado.
+      -- Ver los dos valores es lo que distingue un caso del otro.
+      return nil, "request_hash_mismatch",
+        "veredicto=" .. describe(presented)
+          .. ", body=" .. describe(body_hash)
+          .. ", encoding=" .. describe(conf.request_hash_encoding)
     end
   end
 
@@ -131,11 +231,8 @@ function M.evaluate(verdict, conf, body_hash, now)
     return nil, "app_verdict_rejected"
   end
 
-  if conf.package_name
-    and app_integrity.packageName ~= nil
-    and app_integrity.packageName ~= conf.package_name then
-    return nil, "app_package_mismatch"
-  end
+  -- `appIntegrity.packageName` ya se verificó junto con
+  -- `requestDetails.requestPackageName` en `check_package`.
 
   -- Ata la atestación al certificado de firma de la app: sin esto, un APK
   -- republicado con el mismo package name por otro desarrollador pasaría.
@@ -158,7 +255,9 @@ function M.evaluate(verdict, conf, body_hash, now)
   -- rooteado o manipulado, y no interseca con nada.
   if not intersects(device_integrity.deviceRecognitionVerdict,
                     conf.accepted_device_verdicts) then
-    return nil, "device_verdict_rejected"
+    return nil, "device_verdict_rejected",
+      "recibido=" .. describe(device_integrity.deviceRecognitionVerdict)
+        .. ", aceptados=" .. describe(conf.accepted_device_verdicts)
   end
 
   -- ── accountDetails (opcional) ─────────────────────────────────────────────
