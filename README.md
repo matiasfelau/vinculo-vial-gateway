@@ -158,6 +158,34 @@ no puede pasar por tener una forma más laxa.
 
 Nunca en producción: quien tenga la PSK fabrica cualquier veredicto.
 
+## Tamaño del payload
+
+El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB). El
+techo efectivo se controla en dos capas, y las dos tienen que estar
+coordinadas:
+
+| Capa | Dónde | Qué hace |
+|---|---|---|
+| Piso global de nginx | `nginx_http_client_max_body_size` en `kong.conf` (no templado por entorno) | Corta con un `413` propio de nginx antes de que la request llegue a ningún plugin de Kong |
+| Techo por Route | plugin `request-size-limiting` en `kong.yml`, `SIGNUP_MAX_BODY_MB` | Corta con la respuesta estándar de Kong, sólo en `/auth/signup` |
+
+El plugin corre en prioridad 951 — antes que `rate-limiting` (910) y
+`app-attestation` (900), así que un body de más de `SIGNUP_MAX_BODY_MB` se
+rechaza sin gastar cuota de rate limit ni una llamada a Google.
+
+Es **por Route y no global** a propósito: Kong corre todas las instancias de un
+mismo plugin que apliquen a una request, así que un `request-size-limiting`
+global sumado a éste limitaría todo por el menor de los dos — el mismo motivo
+por el que `rate-limiting` es sólo global y `app-attestation` es sólo por
+Route (ver más abajo).
+
+Si `SIGNUP_MAX_BODY_MB` sube por encima del piso de nginx, ese piso corta
+primero y el plugin nunca llega a correr — hay que subir los dos juntos. El
+buffer de nginx (`nginx_http_client_body_buffer_size`) también tiene que
+quedar igual o mayor al piso: si el body no entra en el buffer, nginx lo
+vuelca a un archivo temporal donde `app-attestation` ya no lo puede leer para
+calcular el `requestHash`.
+
 ## Rate limiting detrás de un proxy
 
 El límite global cuenta **por IP de cliente**. Si el Gateway queda detrás de un

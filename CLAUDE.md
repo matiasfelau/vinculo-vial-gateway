@@ -12,6 +12,12 @@ El Gateway es el único punto de entrada público. Para US-01: enruta `POST /api
 > fuente alternativa (`ATTESTATION_SOURCE=mock`) para CI y desarrollo sin
 > dispositivo físico, con la misma estructura de veredicto que la API real.
 
+> **Nota de evolución.** El payload HPKE de signup ahora incluye una selfie
+> comprimida en base64 (~200KB). El techo de tamaño de request subió a 5MB
+> (`SIGNUP_MAX_BODY_MB` por Route + piso global de nginx en `kong.conf`); ver
+> [Configuración](#configuración). El Gateway sigue sin inspeccionar el body:
+> sólo lo hashea para la ligadura con `requestHash`, nunca lo decodifica.
+
 ## Contrato compartido entre componentes (US-01 — fuente única de verdad, idéntico en los 3 repos)
 
 - **Endpoint**: `POST /api/v1/auth/signup` (síncrono).
@@ -125,6 +131,7 @@ Rama base `dev`. Una rama por feature, `feature/<slug>`, PR + squash merge a `de
 ## Configuración
 `.env.example` documenta todas las variables. Las principales:
 - **Atestación**: `ATTESTATION_SOURCE` (`google`|`mock`), `PLAY_PACKAGE_NAME`, `GOOGLE_SERVICE_ACCOUNT_PATH`, `ATTESTATION_DEVICE_VERDICTS`, `ATTESTATION_MAX_AGE_SECONDS`, `ATTESTATION_REQUEST_HASH_ENCODING`, `APP_ATTESTATION_PSK` (sólo mock).
+- **Tamaño de payload**: `SIGNUP_MAX_BODY_MB` (plugin `request-size-limiting`, por Route). El piso global de nginx (`nginx_http_client_max_body_size`, en `kong.conf`, no templado por env) tiene que ser >= a este valor, o nginx corta antes con su propio 413 y el plugin nunca corre.
 - **Plataforma**: `RATE_LIMIT_PER_MINUTE`, `IDENTITY_SERVICE_URL`, `JWT_PUBLIC_KEY` / `JWT_ISSUER` (Token Offloading), `KONG_TRUSTED_IPS`, puertos de proxy y status.
 
 El service account de Google se **monta como archivo** (`./secrets/`), no se pasa por entorno: la clave privada no tiene por qué estar en el ambiente del proceso ni en la configuración declarativa.

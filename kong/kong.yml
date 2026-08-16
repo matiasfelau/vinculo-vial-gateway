@@ -36,6 +36,25 @@ services:
           - http
           - https
         plugins:
+          # Techo de tamaño específico de esta Route, más ajustado que el piso
+          # global de nginx (kong.conf). Deliberadamente por Route y no global:
+          # Kong corre TODAS las instancias de un mismo plugin que apliquen a
+          # una request (global + Route no es "el más específico gana", son
+          # las dos), así que un `request-size-limiting` global sumado a éste
+          # limitaría todo por el menor de los dos. Mismo motivo que
+          # `rate-limiting` es sólo global y `app-attestation` es sólo por
+          # Route.
+          #
+          # Prioridad nativa 951: corre antes que `rate-limiting` (910) y que
+          # `app-attestation` (900), así que un body de más de
+          # `SIGNUP_MAX_BODY_MB` se rechaza sin gastar cuota de rate limit ni
+          # una llamada a Google.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNUP_MAX_BODY_MB}
+              size_unit: megabytes
+              require_content_length: false
+
           # Seguridad perimetral: sin una atestación válida de Play Integrity
           # la request no alcanza la red interna.
           - name: app-attestation
