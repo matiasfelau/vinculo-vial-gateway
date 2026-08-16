@@ -200,6 +200,17 @@ check "un body distinto con su propio hash sí pasa" \
   200 "$(signup_status "$(body_hash "${body2}")" "${body2}")"
 
 echo
+echo "Identidad de la app"
+
+# Reproduce el rechazo que apareció en la primera prueba contra Google real:
+# la Standard API puede devolver el veredicto sin
+# `requestDetails.requestPackageName`, dejando la identidad sólo en
+# `appIntegrity.packageName`. Exigir el primero rechazaba atestaciones válidas.
+body_nopkg='{"ephemeral_public_key":"QQQQ","ciphertext":"RRRR"}'
+check "un veredicto sin requestPackageName se acepta si appIntegrity coincide" \
+  200 "$(signup_status "NOPKG:$(body_hash "${body_nopkg}")" "${body_nopkg}")"
+
+echo
 echo "Anti-replay"
 
 body3='{"ephemeral_public_key":"EEEE","ciphertext":"FFFF"}'
