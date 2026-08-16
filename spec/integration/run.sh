@@ -15,7 +15,7 @@ readonly NETWORK=vv-integration
 readonly GATEWAY=vv-it-gateway
 readonly STUB=vv-it-google
 readonly UPSTREAM=vv-it-upstream
-readonly PACKAGE_NAME=com.vinculovial.app
+readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"

@@ -66,6 +66,7 @@ services:
               ssl_verify: ${ATTESTATION_SSL_VERIFY}
               # Sólo se usa con source = mock (CI y desarrollo aislado).
               psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}

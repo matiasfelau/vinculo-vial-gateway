@@ -186,12 +186,20 @@ function M.evaluate(verdict, conf, body_hash, now)
   local issued_at = timestamp_millis / 1000
   local skew = conf.clock_skew_seconds or 0
 
+  -- Los desfasajes se reportan en segundos: un reloj mal sincronizado en el
+  -- Gateway se ve como un desvío constante, y eso lo distingue de una
+  -- atestación efectivamente vieja.
   if issued_at - skew > now then
-    return nil, "timestamp_in_future"
+    return nil, "timestamp_in_future",
+      "emitida " .. string.format("%.1f", issued_at - now)
+        .. "s en el futuro, tolerancia=" .. skew .. "s"
   end
 
   if now - issued_at > conf.max_age_seconds + skew then
-    return nil, "attestation_too_old"
+    return nil, "attestation_too_old",
+      "antigüedad=" .. string.format("%.1f", now - issued_at)
+        .. "s, máximo=" .. conf.max_age_seconds
+        .. "s, tolerancia=" .. skew .. "s"
   end
 
   -- Ligadura con el body: el hash lo eligió la app al pedir el token y Google
@@ -228,7 +236,14 @@ function M.evaluate(verdict, conf, body_hash, now)
 
   if not is_accepted(app_integrity.appRecognitionVerdict,
                      conf.accepted_app_verdicts) then
-    return nil, "app_verdict_rejected"
+    -- `UNRECOGNIZED_VERSION` es lo que devuelve Google para un APK que no
+    -- distribuyó él: típicamente un build local firmado con el keystore de
+    -- debug. `UNEVALUATED` significa que ni siquiera llegó a evaluarlo, casi
+    -- siempre porque el dispositivo no calificó — en ese caso el problema real
+    -- está en `deviceIntegrity`, que se valida más abajo.
+    return nil, "app_verdict_rejected",
+      "recibido=" .. describe(app_integrity.appRecognitionVerdict)
+        .. ", aceptados=" .. describe(conf.accepted_app_verdicts)
   end
 
   -- `appIntegrity.packageName` ya se verificó junto con
@@ -239,7 +254,9 @@ function M.evaluate(verdict, conf, body_hash, now)
   local expected_digests = conf.expected_certificate_digests
   if expected_digests and #expected_digests > 0 then
     if not intersects(app_integrity.certificateSha256Digest, expected_digests) then
-      return nil, "certificate_digest_rejected"
+      return nil, "certificate_digest_rejected",
+        "recibido=" .. describe(app_integrity.certificateSha256Digest)
+          .. ", esperados=" .. describe(expected_digests)
     end
   end
 
@@ -269,7 +286,9 @@ function M.evaluate(verdict, conf, body_hash, now)
     end
 
     if not is_accepted(account_details.appLicensingVerdict, accepted_licensing) then
-      return nil, "licensing_verdict_rejected"
+      return nil, "licensing_verdict_rejected",
+        "recibido=" .. describe(account_details.appLicensingVerdict)
+          .. ", aceptados=" .. describe(accepted_licensing)
     end
   end
 

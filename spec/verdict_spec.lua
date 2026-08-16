@@ -150,11 +150,33 @@ describe("política de atestación", function()
     end)
 
     it("rechaza una app no reconocida por Play", function()
-      local ok, reason = evaluate({
+      -- Lo que devuelve Google para un APK que no distribuyó él: un build
+      -- local firmado con el keystore de debug, por ejemplo.
+      local ok, reason, detail = evaluate({
         appIntegrity = { appRecognitionVerdict = "UNRECOGNIZED_VERSION" },
       })
       assert.is_nil(ok)
       assert.equals("app_verdict_rejected", reason)
+      assert.matches("UNRECOGNIZED_VERSION", detail, 1, true)
+      assert.matches("PLAY_RECOGNIZED", detail, 1, true)
+    end)
+
+    it("rechaza una app que Google no llegó a evaluar", function()
+      local ok, reason, detail = evaluate({
+        appIntegrity = { appRecognitionVerdict = "UNEVALUATED" },
+      })
+      assert.is_nil(ok)
+      assert.equals("app_verdict_rejected", reason)
+      assert.matches("UNEVALUATED", detail, 1, true)
+    end)
+
+    it("permite aceptar builds no distribuidos por Play, para desarrollo", function()
+      -- Aflojar esto desactiva de hecho la verificación de que la app sea la
+      -- legítima; existe para poder iterar sin subir a Play en cada cambio.
+      assert.is_true(evaluate(
+        { appIntegrity = { appRecognitionVerdict = "UNRECOGNIZED_VERSION" } },
+        { accepted_app_verdicts = { "PLAY_RECOGNIZED", "UNRECOGNIZED_VERSION" } }
+      ))
     end)
 
     it("rechaza un certificado de firma distinto del esperado", function()
@@ -216,11 +238,14 @@ describe("política de atestación", function()
 
   describe("frescura", function()
     it("rechaza una atestación más vieja que la ventana permitida", function()
-      local ok, reason = evaluate({
+      local ok, reason, detail = evaluate({
         requestDetails = { timestampMillis = tostring((NOW - 151) * 1000) },
       })
       assert.is_nil(ok)
       assert.equals("attestation_too_old", reason)
+      -- El desfasaje en segundos distingue un reloj mal sincronizado en el
+      -- Gateway (desvío constante) de una atestación realmente vieja.
+      assert.matches("151", detail, 1, true)
     end)
 
     it("rechaza un timestamp en el futuro fuera de la tolerancia", function()

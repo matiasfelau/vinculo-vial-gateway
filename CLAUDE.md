@@ -134,6 +134,7 @@ Rama base `dev`. Una rama por feature, `feature/<slug>`, PR + squash merge a `de
 ## Configuración
 `.env.example` documenta todas las variables. Las principales:
 - **Atestación**: `ATTESTATION_SOURCE` (`google`|`mock`), `PLAY_PACKAGE_NAME`, `GOOGLE_SERVICE_ACCOUNT_PATH`, `ATTESTATION_DEVICE_VERDICTS`, `ATTESTATION_MAX_AGE_SECONDS`, `ATTESTATION_REQUEST_HASH_ENCODING`, `APP_ATTESTATION_PSK` (sólo mock).
+- **Veredictos**: `ATTESTATION_APP_VERDICTS` y `ATTESTATION_DEVICE_VERDICTS`. Un build de Android Studio nunca es `PLAY_RECOGNIZED` (está firmado con el keystore de debug): para probar con el veredicto real hay que instalar desde Play (Internal App Sharing). Aceptar `UNRECOGNIZED_VERSION` desactiva de hecho la verificación de que la app sea legítima — sólo desarrollo.
 - **Tamaño de payload**: `SIGNUP_MAX_BODY_MB` (plugin `request-size-limiting`, por Route). El piso global de nginx (`nginx_http_client_max_body_size`, en `kong.conf`, no templado por env) tiene que ser >= a este valor, o nginx corta antes con su propio 413 y el plugin nunca corre.
 - **Plataforma**: `RATE_LIMIT_PER_MINUTE`, `IDENTITY_SERVICE_URL`, `JWT_PUBLIC_KEY` / `JWT_ISSUER` (Token Offloading), `KONG_TRUSTED_IPS`, puertos de proxy y status.
 
