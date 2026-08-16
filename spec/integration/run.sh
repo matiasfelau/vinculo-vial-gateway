@@ -15,7 +15,7 @@ readonly NETWORK=vv-integration
 readonly GATEWAY=vv-it-gateway
 readonly STUB=vv-it-google
 readonly UPSTREAM=vv-it-upstream
-readonly PACKAGE_NAME=ar.vinculovial.app
+readonly PACKAGE_NAME=com.vinculovial.app
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -209,6 +209,14 @@ echo "Identidad de la app"
 body_nopkg='{"ephemeral_public_key":"QQQQ","ciphertext":"RRRR"}'
 check "un veredicto sin requestPackageName se acepta si appIntegrity coincide" \
   200 "$(signup_status "NOPKG:$(body_hash "${body_nopkg}")" "${body_nopkg}")"
+
+# Comprobado contra Google real: `decodeIntegrityToken` devuelve 200 con un
+# veredicto válido aunque el token lo haya generado otra app. Este chequeo del
+# Gateway es el ÚNICO control que lo detecta — sin él, una atestación legítima
+# de cualquier otra aplicación pasaría.
+body_otherpkg='{"ephemeral_public_key":"SSSS","ciphertext":"TTTT"}'
+check "un veredicto válido de OTRA app se rechaza" \
+  403 "$(signup_status "OTHERPKG:$(body_hash "${body_otherpkg}")" "${body_otherpkg}")"
 
 echo
 echo "Anti-replay"

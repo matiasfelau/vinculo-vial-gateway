@@ -159,6 +159,13 @@ ausente y dejar la identidad sólo en `appIntegrity.packageName`. El criterio es
   (`package_name_absent`), porque sin identidad un token de cualquier otra app
   pasaría.
 
+> **Esta comparación es la que detecta un token de otra app; no es redundante.**
+> Comprobado en producción: `decodeIntegrityToken` devuelve `200` con un
+> veredicto perfectamente válido aunque el package de la URL no sea el de la app
+> que generó el token. Google descifra y devuelve el veredicto, y deja en manos
+> del servidor verificar para qué app se emitió. Sacar este chequeo dejaría
+> pasar atestaciones legítimas de cualquier otra aplicación.
+
 ### Diagnóstico
 
 Los rechazos donde "¿qué recibió?" es toda la pregunta —package, veredicto de
@@ -167,8 +174,8 @@ esperaba:
 
 ```
 app-attestation: request rechazado (package_mismatch) —
-  requestDetails.requestPackageName='ar.vinculovial.app.debug',
-  esperado='ar.vinculovial.app'
+  requestDetails.requestPackageName='com.vinculovial.app.debug',
+  esperado='com.vinculovial.app'
 
 app-attestation: request rechazado (device_verdict_rejected) —
   recibido=['MEETS_BASIC_INTEGRITY'],
