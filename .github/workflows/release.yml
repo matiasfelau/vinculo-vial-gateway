@@ -59,19 +59,35 @@ jobs:
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
+      # Se construye ANTES de autenticarse. Si el login fuera antes, esas
+      # credenciales quedarían activas también para el `FROM kong:3.7` de más
+      # abajo: un token de Docker Hub scopeado a los repos de
+      # felaufernandezbottaro rechaza el pull de una imagen pública ajena a
+      # ese scope ("access token has insufficient scopes"), aunque cualquiera
+      # sin loguearse la baja sin problema. `load: true` importa el resultado
+      # al daemon local, para poder pushearlo recién después del login.
+      - name: Build (sin autenticar; evita el pull de kong:3.7 con un token de scope ajeno)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Cache entre corridas: evita recompilar capas que no cambiaron
+          # (la instalación de paquetes apt, sobre todo). No requiere estar
+          # autenticado contra Docker Hub: es el backend de cache de GitHub
+          # Actions, no un registry.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Iniciar sesión en Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build y push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          # Cache entre corridas: evita recompilar capas que no cambiaron
-          # (la instalación de paquetes apt, sobre todo).
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Push
+        run: |
+          for tag in $(echo "${{ steps.tags.outputs.tags }}" | tr ',' ' '); do
+            docker push "${tag}"
+          done
