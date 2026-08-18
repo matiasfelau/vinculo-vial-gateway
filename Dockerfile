@@ -10,7 +10,9 @@ FROM kong:3.7
 USER root
 
 # `gettext-base` aporta envsubst, con el que el entrypoint resuelve la config
-# declarativa; `curl` es para el healthcheck contra la Admin API.
+# declarativa; `curl` es para el healthcheck contra el Status API (:8100).
+# Se instalan y se necesitan en runtime (no sólo en build), así que no hay
+# ganancia de tamaño en separarlos en una etapa aparte.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gettext-base curl \
  && rm -rf /var/lib/apt/lists/*
@@ -36,7 +38,10 @@ ENV KONG_LUA_PACKAGE_PATH="/opt/kong/?.lua;;"
 
 USER kong
 
-EXPOSE 8000 8001
+# Proxy (único punto de entrada público) y Status API (sólo lectura, healthcheck).
+# La Admin API queda apagada por config (admin_listen = off en kong.conf): no
+# se expone ningún puerto para ella.
+EXPOSE 8000 8100
 
 # El entrypoint propio renderiza la config y delega en el de la imagen oficial.
 ENTRYPOINT ["/usr/local/bin/vv-entrypoint.sh"]
