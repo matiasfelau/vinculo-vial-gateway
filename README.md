@@ -68,9 +68,27 @@ era el healthcheck, y para eso alcanza el Status API. Apagarla elimina la
 superficie en vez de depender de que quien despliegue se acuerde de no publicar
 el puerto.
 
-El Gateway se conecta a la red Docker `vinculo-vial`, compartida con el resto
-de los componentes: `IDENTITY_SERVICE_URL` apunta al nombre de servicio de
-`vinculo-vial-identity` dentro de esa red.
+El Gateway crea y se conecta a la red Docker `vinculo-vial`, compartida con el
+resto de los componentes, y alcanza a Identity en `IDENTITY_SERVICE_URL`
+(`http://vinculo-vial-identity:8080` por defecto).
+
+> **Identity tiene que unirse a esa red y anunciarse con el alias
+> `vinculo-vial-identity`.** En su compose el servicio se llama `identity`, y
+> `vinculo-vial-identity` es el nombre del *proyecto* — que no es un hostname
+> resolvible. Sin el alias, Kong devuelve `503` con
+> `dns server error: 3 name error` aunque Identity esté perfectamente sano.
+> El bloque exacto que va en el compose de Identity está en
+> [CLAUDE.md](CLAUDE.md#contrato-compartido-entre-componentes-us-01--fuente-única-de-verdad-idéntico-en-los-3-repos).
+>
+> Para destrabar sin tocar el compose de Identity, sobre los contenedores ya
+> corriendo:
+>
+> ```bash
+> docker network connect --alias vinculo-vial-identity \
+>   vinculo-vial vinculo-vial-identity-identity-1
+> ```
+>
+> Es efímero: se pierde en cuanto Compose recree el contenedor.
 
 El `kong.yml` versionado es una **plantilla**: el entrypoint resuelve los
 `${VARIABLE}` contra el entorno en cada arranque, valida el resultado con

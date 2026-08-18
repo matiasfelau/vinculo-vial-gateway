@@ -42,6 +42,21 @@ El Gateway es el único punto de entrada público. Para US-01: enruta `POST /api
   { "eventId": "<uuid>", "eventType": "user.created", "timestamp": "<iso8601>", "producer": "vinculo-vial-identity", "actor": null, "payload": { "userId": "<uuid>" } }
   ```
   `actor: null` porque en signup todavía no hay sesión/usuario autenticado actuando.
+- **Red de la plataforma** (contrato de infraestructura, no de HTTP): el Gateway alcanza a Identity en `http://vinculo-vial-identity:8080` sobre la red Docker `vinculo-vial`, que crea el compose del Gateway. Para que ese nombre resuelva, **Identity tiene que unirse a esa red y anunciarse con el alias `vinculo-vial-identity`**: el nombre de servicio de su compose es `identity`, y `vinculo-vial-identity` es el nombre del *proyecto*, que no es un hostname. Sin el alias, Kong responde `503` con `dns server error: 3 name error` aunque Identity esté sano.
+  ```yaml
+  # docker-compose.yml de vinculo-vial-identity
+  networks:
+    vinculo-vial:
+      external: true          # la crea el compose del Gateway; levantarlo primero
+
+  services:
+    identity:
+      networks:
+        default:              # para hablar con su postgres
+        vinculo-vial:
+          aliases:
+            - vinculo-vial-identity
+  ```
 - **Variables de entorno compartidas conceptualmente** (mismo secreto/par de claves en dos repos, nombre puede variar levemente por convención de cada lenguaje pero el valor debe coincidir):
   - `PLAY_PACKAGE_NAME` — mismo package name en Frontend (Play Console) y Gateway.
   - `ATTESTATION_REQUEST_HASH_ENCODING` — cómo codifica el Frontend el SHA-256 del body (`hex` por defecto). Debe coincidir exactamente o toda atestación falla.
