@@ -1,0 +1,84 @@
+# CLAUDE.md fija que los PR se mergean a `dev` "con tests en verde". Esto es lo
+# que lo hace cumplir: sin este workflow, la regla dependía de que alguien se
+# acordara de correr Busted a mano.
+name: tests
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+# Un PR con varios pushes seguidos sólo necesita el resultado del último.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  busted:
+    name: Busted (plugins Lua)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # La imagen de test se construye sobre la misma imagen de Kong que usa
+      # producción: los specs corren contra el runtime real de OpenResty.
+      - name: Construir la imagen de test
+        run: docker build -f Dockerfile.test -t vinculo-vial-gateway-tests .
+
+      - name: Correr la suite
+        run: docker run --rm vinculo-vial-gateway-tests
+
+  config:
+    name: Configuración declarativa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construir la imagen del Gateway
+        run: docker build -t vinculo-vial-gateway:ci .
+
+      # Levanta el contenedor con valores de ejemplo: valida de punta a punta
+      # que la plantilla renderiza, que `kong config parse` acepta el resultado
+      # y que los plugins custom cargan. Un error de sintaxis en un `.lua` o un
+      # nombre de plugin mal escrito falla acá, no en el deploy.
+      - name: Verificar que Kong arranca y queda healthy
+        run: |
+          set -euo pipefail
+          docker run -d --name gateway-ci --env-file .env.example \
+            -e IDENTITY_SERVICE_URL=http://identity.invalid:8080 \
+            vinculo-vial-gateway:ci
+
+          for i in $(seq 1 30); do
+            if docker exec gateway-ci curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+              echo "Kong respondió healthy tras ${i}s"
+              exit 0
+            fi
+            if ! docker ps --filter name=gateway-ci --filter status=running -q | grep -q .; then
+              echo "El contenedor se detuvo durante el arranque:"
+              docker logs gateway-ci
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "Timeout esperando el healthcheck:"
+          docker logs gateway-ci
+          exit 1
+
+      - name: Logs del Gateway
+        if: always()
+        run: docker logs gateway-ci 2>&1 | tail -50
+
+  integration:
+    name: Integración (Play Integrity contra stub)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ejercita el camino HTTP completo contra Google —firma de la aserción
+      # del service account, canje por access token, decodeIntegrityToken— que
+      # los tests unitarios no pueden cubrir. Sin credenciales reales: el stub
+      # emula ambos endpoints.
+      - name: Correr la suite de integración
+        run: bash spec/integration/run.sh

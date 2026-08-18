@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Imagen de test de los plugins Lua.
+#
+# Parte de la misma imagen de Kong que usa producción para que los specs corran
+# sobre el runtime real de OpenResty (`ngx.*`, `resty.openssl`, LuaJIT) en vez
+# de mockearlo. Busted se ejecuta a través de `resty`, sin levantar Kong.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM kong:3.7
+
+USER root
+
+# El manifiesto raíz de luarocks.org no se puede parsear con LuaJIT (excede el
+# límite de constantes del compilador), así que cada rock se instala desde el
+# manifiesto de su autor. `build-essential` hace falta para las dependencias
+# con componentes en C (luasystem, lua-term).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends build-essential; \
+    rm -rf /var/lib/apt/lists/*; \
+    RT_LIBDIR="$(dirname "$(ls /usr/lib/*/librt.so.1 | head -n1)")"; \
+    LR_LUNAR="https://luarocks.org/manifests/lunarmodules"; \
+    luarocks --only-server="$LR_LUNAR" install luasystem RT_LIBDIR="$RT_LIBDIR"; \
+    luarocks --only-server="$LR_LUNAR" install lua_cliargs; \
+    luarocks --only-server="$LR_LUNAR" install luassert; \
+    luarocks --only-server="$LR_LUNAR" install say; \
+    luarocks --only-server="https://luarocks.org/manifests/olivine-labs" install mediator_lua; \
+    luarocks --only-server="https://luarocks.org/manifests/dhkolf" install dkjson; \
+    luarocks install https://luarocks.org/manifests/hoelzro/lua-term-0.7-1.rockspec; \
+    luarocks --only-server="$LR_LUNAR" install busted 2.0.0; \
+    apt-get purge -y --auto-remove build-essential
+
+# `busted` pasa a ser un wrapper sobre resty: así el comando documentado
+# (`busted spec/`) funciona tal cual dentro del contenedor.
+RUN printf '#!/usr/bin/env bash\nexec resty /app/spec/busted_runner.lua "$@"\n' \
+      > /usr/local/bin/busted \
+ && chmod +x /usr/local/bin/busted
+
+WORKDIR /app
+COPY .busted ./
+COPY kong/plugins/ ./kong/plugins/
+COPY kong/lib/ ./kong/lib/
+COPY spec/ ./spec/
+
+CMD ["busted", "spec/"]

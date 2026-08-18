@@ -1,0 +1,160 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuración declarativa de Kong (modo DB-less).
+#
+# Este archivo es una plantilla: los placeholders ${VARIABLE} se resuelven en
+# el arranque del contenedor (docker/entrypoint.sh) contra las variables de
+# entorno, y el resultado se escribe en `declarative_config` (kong.conf).
+# Nunca se versionan secretos acá.
+# ─────────────────────────────────────────────────────────────────────────────
+_format_version: "3.0"
+_transform: true
+
+services:
+  # ── vinculo-vial-identity ──────────────────────────────────────────────────
+  # Servicio de identidad: registro, autenticación y gestión de usuarios.
+  - name: identity-service
+    url: ${IDENTITY_SERVICE_URL}
+    # El registro es una operación no idempotente (crea un usuario): sólo se
+    # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
+    retries: 1
+    connect_timeout: 5000
+    write_timeout: 15000
+    read_timeout: 15000
+    routes:
+      # US-01 — Registro. El body es un sobre HPKE: el Gateway no lo inspecciona
+      # ni lo modifica, sólo lo reenvía.
+      - name: identity-signup
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/signup
+        # La ruta pública y la del upstream son idénticas: no se recorta el path.
+        strip_path: false
+        # El upstream recibe su propio Host, no el del cliente.
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Techo de tamaño específico de esta Route, más ajustado que el piso
+          # global de nginx (kong.conf). Deliberadamente por Route y no global:
+          # Kong corre TODAS las instancias de un mismo plugin que apliquen a
+          # una request (global + Route no es "el más específico gana", son
+          # las dos), así que un `request-size-limiting` global sumado a éste
+          # limitaría todo por el menor de los dos. Mismo motivo que
+          # `rate-limiting` es sólo global y `app-attestation` es sólo por
+          # Route.
+          #
+          # Prioridad nativa 951: corre antes que `rate-limiting` (910) y que
+          # `app-attestation` (900), así que un body de más de
+          # `SIGNUP_MAX_BODY_MB` se rechaza sin gastar cuota de rate limit ni
+          # una llamada a Google.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNUP_MAX_BODY_MB}
+              size_unit: megabytes
+              require_content_length: false
+
+          # Seguridad perimetral: sin una atestación válida de Play Integrity
+          # la request no alcanza la red interna.
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+
+      # ── Scaffolding de Token Offloading ──────────────────────────────────
+      # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
+      # armado: no aplica a US-01 (en signup todavía no hay token). El par
+      # `jwt` + `token-offloading` es el que se replica en cada endpoint
+      # autenticado de la plataforma.
+      - name: identity-profile
+        methods:
+          - GET
+        paths:
+          - /api/v1/users/me
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Verifica la firma RS256 contra la clave pública de Identity.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          # Traduce el `sub` ya validado a `X-User-Hash` y quita el
+          # `Authorization` antes de reenviar.
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Hash
+              remove_authorization: true
+
+# ── Consumers ────────────────────────────────────────────────────────────────
+# En este modelo el emisor de los tokens es Identity, no cada usuario final: el
+# Gateway sólo necesita la clave pública para verificar la firma, y la
+# identidad del usuario viaja en el claim `sub`.
+consumers:
+  - username: vinculo-vial-identity
+    jwt_secrets:
+      - key: ${JWT_ISSUER}
+        algorithm: RS256
+        rsa_public_key: "${JWT_PUBLIC_KEY}"
+
+# ── Plugins globales ─────────────────────────────────────────────────────────
+# Sin `service` ni `route` asociados: aplican a todo el tráfico que atraviesa el
+# Gateway, para toda la plataforma.
+plugins:
+  # Identificador de correlación para trazar una operación a través de todos
+  # los componentes: el Gateway lo genera si el cliente no lo trae, Identity lo
+  # propaga a sus logs y al evento `user.created` de RabbitMQ. Sin esto, cruzar
+  # un signup fallido entre los logs de tres repos es adivinanza.
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-Id
+      generator: uuid
+      # Se devuelve también al cliente: si la app reporta un error, el
+      # identificador que ve el usuario es el mismo que está en los logs.
+      echo_downstream: true
+
+  # Los headers de identidad los escribe exclusivamente el Gateway: los
+  # servicios internos confían en `X-User-Hash` porque llega por la red
+  # interna. Si un cliente lo manda desde afuera y lo dejamos pasar, suplanta
+  # a cualquier usuario. Se descarta en TODAS las rutas, incluidas las que no
+  # tienen `token-offloading` (como signup).
+  # Corre en prioridad 801, después de `app-attestation` (900) y antes de
+  # `token-offloading` (790), que es quien inyecta el valor legítimo.
+  - name: request-transformer
+    config:
+      remove:
+        headers:
+          - X-User-Hash
+
+  # Rate limiting perimetral por IP de cliente. Primera línea de defensa contra
+  # fuerza bruta y abuso automatizado sobre cualquier endpoint.
+  - name: rate-limiting
+    config:
+      minute: ${RATE_LIMIT_PER_MINUTE}
+      # `local`: el contador vive en la memoria compartida del nodo. Es la única
+      # política coherente en DB-less mononodo; al escalar horizontalmente se
+      # migra a `redis` sin tocar el resto de la configuración.
+      policy: local
+      limit_by: ip
+      # Si el backend del contador falla, no se corta el tráfico legítimo.
+      fault_tolerant: true
+      # Se exponen los headers RateLimit-* para que la app pueda hacer backoff.
+      hide_client_headers: false
+      error_code: 429
+      error_message: "API rate limit exceeded"

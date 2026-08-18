@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Un único servicio: Kong en modo DB-less.
+#
+# No hay Postgres (DB-less no lo necesita) ni RabbitMQ (el Gateway no publica
+# ni consume eventos). La red `vinculo-vial` es la que comparten los demás
+# componentes de la plataforma, y es por donde el Gateway alcanza a Identity.
+# ─────────────────────────────────────────────────────────────────────────────
+name: vinculo-vial-gateway
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vinculo-vial-gateway:local
+    container_name: vinculo-vial-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Credenciales de Google. Se montan como archivo de sólo lectura en vez
+      # de pasarse por entorno: la clave privada del service account no tiene
+      # por qué estar en el ambiente del proceso ni en la config declarativa.
+      # `./secrets` no se versiona; ver .env.example.
+      - ./secrets:/etc/vinculo-vial:ro
+    ports:
+      # Proxy: único punto de entrada público de la plataforma.
+      - "${GATEWAY_PROXY_PORT:-8000}:8000"
+      # Status API (sólo lectura): únicamente desde el host, nunca desde la red.
+      - "127.0.0.1:${GATEWAY_STATUS_PORT:-8100}:8100"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8100/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - vinculo-vial
+
+networks:
+  vinculo-vial:
+    name: vinculo-vial
