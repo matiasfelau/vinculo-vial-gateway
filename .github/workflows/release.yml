@@ -1,0 +1,72 @@
+# Publica la imagen del Gateway a Docker Hub.
+#
+# `publish` depende de `tests` (la misma suite que corre en cada PR, reusada
+# vía `workflow_call`): no hay build-and-push directo, la publicación exige
+# que unitarios, arranque de Kong e integración contra el stub de Google
+# hayan pasado para ESTE commit puntual.
+#
+# Se dispara con:
+#   - push a `main` (después de un merge)      -> publica `latest` + `sha-<corto>`
+#   - push de un tag `vX.Y.Z`                   -> además publica ese tag exacto
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+# Un push a main y su tag correspondiente pueden disparar dos corridas casi
+# simultáneas sobre el mismo contenido; no tiene sentido cancelarse entre sí
+# (cada una construye un set de tags distinto), así que el grupo de
+# concurrencia es por SHA, no por rama.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests (gate de publicación)
+    uses: ./.github/workflows/tests.yml
+
+  publish:
+    name: Build y push a Docker Hub
+    needs: [tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # `latest` y el SHA corto se publican siempre. El tag semántico sólo
+      # cuando el disparador fue un push de tag `vX.Y.Z` — `github.ref_name`
+      # es el nombre del tag en ese caso, o el de la rama (`main`) si no.
+      - name: Preparar los tags de la imagen
+        id: tags
+        env:
+          IMAGE: felaufernandezbottaro/vinculo-vial-gateway
+          REF_NAME: ${{ github.ref_name }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          short="$(git rev-parse --short=7 HEAD)"
+          tags="${IMAGE}:latest,${IMAGE}:sha-${short}"
+          if [ "${IS_TAG}" = "true" ]; then
+            tags="${tags},${IMAGE}:${REF_NAME}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Iniciar sesión en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build y push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Cache entre corridas: evita recompilar capas que no cambiaron
+          # (la instalación de paquetes apt, sobre todo).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

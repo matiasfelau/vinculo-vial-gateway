@@ -1,6 +1,6 @@
-# CLAUDE.md fija que los PR se mergean a `dev` "con tests en verde". Esto es lo
-# que lo hace cumplir: sin este workflow, la regla dependía de que alguien se
-# acordara de correr Busted a mano.
+# La convención del equipo es mergear a `dev` sólo con tests en verde. Esto es
+# lo que lo hace cumplir: sin este workflow, la regla dependía de que alguien
+# se acordara de correr Busted a mano.
 name: tests
 
 on:
@@ -8,6 +8,9 @@ on:
     branches: [dev, main]
   push:
     branches: [dev, main]
+  # Permite que `release.yml` reuse esta suite como gate antes de publicar,
+  # en vez de duplicar los mismos tres jobs en dos archivos.
+  workflow_call:
 
 # Un PR con varios pushes seguidos sólo necesita el resultado del último.
 concurrency:

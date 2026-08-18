@@ -1,0 +1,44 @@
+# El Dockerfile copia rutas explícitas (kong/plugins, kong/lib, kong.conf,
+# kong.yml, docker/entrypoint.sh), no `COPY . .`, así que nada de esto entra
+# a la imagen de por sí. Este archivo es la segunda barrera: reduce el
+# contexto que se envía al daemon de build y evita que un futuro `COPY .`
+# lo cambie en silencio.
+
+# Instrucciones y configuración de herramientas internas: nunca deben llegar
+# al contexto de build ni a la imagen publicada.
+CLAUDE.md
+.clauderules
+
+# Control de versiones y CI.
+.git/
+.github/
+
+# Secretos y configuración de entorno. Sólo .env.example es seguro.
+.env
+.env.*
+!.env.example
+secrets/
+
+# `spec/` NO se excluye acá a propósito: `.dockerignore` aplica al contexto de
+# build completo, compartido por `Dockerfile` y `Dockerfile.test`, y este
+# último copia `spec/` para correr los tests dentro del contenedor. La imagen
+# de producción (`Dockerfile`) nunca la copia, así que igual no llega a esa
+# imagen aunque esté disponible en el contexto.
+
+# Documentación y metadata del repo.
+*.md
+!README.md
+
+# Editores / SO.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Artefactos locales.
+*.log
+servroot/
+kong.rendered.yml
+kong.declarative.yml
+.luarocks/
+lua_modules/
