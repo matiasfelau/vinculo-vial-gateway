@@ -4,23 +4,24 @@ API Gateway de la plataforma **Vínculo Vial**, construido sobre **Kong 3.7 en m
 DB-less**. Es el único punto de entrada público: enruta el tráfico hacia los
 servicios internos y concentra la seguridad perimetral.
 
-Para US-01 (Registro) expone `POST /api/v1/auth/signup` hacia
-`vinculo-vial-identity` y valida el **Mock App Attestation**
-(`X-App-Attestation`) antes de permitir tráfico hacia la red interna. El body
-nunca se inspecciona ni se modifica: viaja cifrado extremo a extremo (HPKE).
+Expone `POST /api/v1/auth/signup` (US-01, Registro) y `POST /api/v1/auth/signin`
+(US-02, Login) hacia `vinculo-vial-identity`, y valida **App Attestation**
+(`X-App-Attestation`, contra Google Play Integrity) en las dos antes de
+permitir tráfico hacia la red interna. El body nunca se inspecciona ni se
+modifica: viaja cifrado extremo a extremo (HPKE).
 
 ## Estado
 
 | Capacidad | Estado |
 |---|---|
 | Bootstrap DB-less + logging + Status API | ✅ |
-| Ruteo declarativo a `identity-service` | ✅ |
+| Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`) | ✅ |
 | Rate limiting global | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | Token offloading (`X-User-Hash`) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 83 tests unitarios + 18 de integración | ✅ |
+| CI: 83 tests unitarios + 28 de integración | ✅ |
 
 ## Estructura
 
@@ -258,17 +259,18 @@ Nunca en producción: quien tenga la PSK fabrica cualquier veredicto.
 
 ## Tamaño del payload
 
-El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB). El
-techo efectivo se controla en dos capas, y las dos tienen que estar
-coordinadas:
+El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB); el de
+signin sólo lleva credenciales. Cada Route tiene su propio techo, coherente con
+lo que realmente transporta. El techo efectivo se controla en dos capas, y las
+dos tienen que estar coordinadas:
 
 | Capa | Dónde | Qué hace |
 |---|---|---|
 | Piso global de nginx | `nginx_http_client_max_body_size` en `kong.conf` (no templado por entorno) | Corta con un `413` propio de nginx antes de que la request llegue a ningún plugin de Kong |
-| Techo por Route | plugin `request-size-limiting` en `kong.yml`, `SIGNUP_MAX_BODY_MB` | Corta con la respuesta estándar de Kong, sólo en `/auth/signup` |
+| Techo por Route | plugin `request-size-limiting` en `kong.yml`, `SIGNUP_MAX_BODY_MB` en `/auth/signup`, `SIGNIN_MAX_BODY_KB` en `/auth/signin` | Corta con la respuesta estándar de Kong, sólo en su propia Route |
 
 El plugin corre en prioridad 951 — antes que `rate-limiting` (910) y
-`app-attestation` (900), así que un body de más de `SIGNUP_MAX_BODY_MB` se
+`app-attestation` (900), así que un body por encima del techo de su Route se
 rechaza sin gastar cuota de rate limit ni una llamada a Google.
 
 Es **por Route y no global** a propósito: Kong corre todas las instancias de un
@@ -277,12 +279,12 @@ global sumado a éste limitaría todo por el menor de los dos — el mismo motiv
 por el que `rate-limiting` es sólo global y `app-attestation` es sólo por
 Route (ver más abajo).
 
-Si `SIGNUP_MAX_BODY_MB` sube por encima del piso de nginx, ese piso corta
+Si alguno de los dos techos sube por encima del piso de nginx, ese piso corta
 primero y el plugin nunca llega a correr — hay que subir los dos juntos. El
 buffer de nginx (`nginx_http_client_body_buffer_size`) también tiene que
-quedar igual o mayor al piso: si el body no entra en el buffer, nginx lo
-vuelca a un archivo temporal donde `app-attestation` ya no lo puede leer para
-calcular el `requestHash`.
+quedar igual o mayor al mayor de los dos techos: si el body no entra en el
+buffer, nginx lo vuelca a un archivo temporal donde `app-attestation` ya no lo
+puede leer para calcular el `requestHash`.
 
 ## Rate limiting detrás de un proxy
 
@@ -309,9 +311,9 @@ operación entre los logs de los tres repos.
 `X-User-Hash` lo escribe **exclusivamente el Gateway**, a partir del `sub` de un
 JWT ya verificado: los servicios internos confían en él porque llega por la red
 interna. Por eso el header entrante se descarta en **todas** las rutas —
-incluida `/auth/signup`, que no tiene `token-offloading`— mediante un
-`request-transformer` global. Sin eso, cualquiera podría suplantar a otro
-usuario mandando el header desde afuera.
+incluidas `/auth/signup` y `/auth/signin`, que no tienen `token-offloading`—
+mediante un `request-transformer` global. Sin eso, cualquiera podría suplantar
+a otro usuario mandando el header desde afuera.
 
 El orden de plugins que lo hace posible:
 
