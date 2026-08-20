@@ -71,11 +71,54 @@ services:
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
 
+      # US-02 — Login. Mismo esquema de body que signup: sobre HPKE, el
+      # Gateway no lo inspecciona ni lo modifica, sólo lo reenvía. Identity
+      # emite el Access Token (JWT RS256, 15 min) y el Refresh Token (opaco,
+      # 30 días) — el Gateway no participa de esa emisión, sólo perimetra el
+      # endpoint.
+      - name: identity-signin
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/signin
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Techo propio, más chico que el de signup: este body no lleva una
+          # selfie, sólo credenciales. Mismo motivo que en signup para correr
+          # antes que `app-attestation` — un límite bajo en bytes es barato de
+          # aplicar y evita gastar una llamada a Google en un body imposible.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNIN_MAX_BODY_KB}
+              size_unit: kilobytes
+              require_content_length: false
+
+          # Mismo perímetro que signup: el login es, si no más, un blanco
+          # igual de natural de fuerza bruta y credential stuffing, y encima
+          # es el endpoint que primero emite tokens de sesión.
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
-      # armado: no aplica a US-01 (en signup todavía no hay token). El par
-      # `jwt` + `token-offloading` es el que se replica en cada endpoint
-      # autenticado de la plataforma.
+      # armado: no aplica a US-01/US-02 (signup y signin todavía no llevan
+      # Access Token entrante). El par `jwt` + `token-offloading` es el que se
+      # replica en cada endpoint autenticado de la plataforma.
       - name: identity-profile
         methods:
           - GET
