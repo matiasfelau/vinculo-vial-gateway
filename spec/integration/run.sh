@@ -92,6 +92,21 @@ signup_status() {
     --data-binary "${body}"
 }
 
+# Igual que signup_status, pero contra /auth/signin (US-02). El plugin
+# `app-attestation` es la misma instancia/lógica en ambas Routes: lo que este
+# helper ejercita es el ruteo y la config propia de la Route de signin
+# (el techo de tamaño), no la política de atestación en sí — esa ya está
+# cubierta en detalle contra signup, más arriba.
+signin_status() {
+  local attestation="$1" body="${2:-}"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/signin \
+    -H "X-App-Attestation: ${attestation}" \
+    -H 'Content-Type: application/json' \
+    --data-binary "${body}"
+}
+
 # SHA-256 del body en hexadecimal: lo mismo que calcula el Gateway y lo que el
 # Frontend le pasa a `setRequestHash()`.
 body_hash() {
@@ -333,6 +348,63 @@ echo "Caché del access token"
 token_requests="$(docker logs "${STUB}" 2>&1 | grep -c 'POST /token' || true)"
 check "el access token se pide una sola vez, no por request" \
   1 "${token_requests}"
+
+echo
+echo "Login (US-02)"
+
+# La política de atestación en sí (ligadura, replay, veredictos, errores de
+# Google) ya está cubierta en detalle contra signup: es la misma instancia de
+# plugin. Acá sólo se verifica lo específico de esta Route: que el header
+# siga siendo obligatorio, que una atestación válida efectivamente pase, el
+# contrato de la respuesta, y el techo de tamaño propio (mucho más chico que
+# el de signup, porque el body no lleva una selfie).
+
+check "sin header, 403 sin siquiera llamar a Google" \
+  403 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/signin -d '{}')"
+
+signin_body='{"ephemeral_public_key":"ZZZZ","ciphertext":"ZZZZ"}'
+signin_hash="$(body_hash "${signin_body}")"
+
+check "atestación válida ligada al body llega al upstream" \
+  200 "$(signin_status "${signin_hash}" "${signin_body}")"
+
+# Body propio para este chequeo: el anti-replay ya probado más arriba
+# rechazaría un segundo uso del mismo token de la request anterior.
+signin_body2='{"ephemeral_public_key":"YYYY","ciphertext":"WWWW"}'
+signin_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signin \
+  -H "X-App-Attestation: $(body_hash "${signin_body2}")" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${signin_body2}")"
+
+check_contains "el body llega intacto al upstream" \
+  "WWWW" "${signin_upstream_view}"
+check_not_contains "el token de atestación no se propaga al upstream" \
+  "x-app-attestation" "$(printf '%s' "${signin_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Tamaño del payload de login"
+
+signin_google_calls_before="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+
+# Un byte por encima de SIGNIN_MAX_BODY_KB (64KB). El contenido no importa: se
+# rechaza antes de leerlo entero.
+docker exec "${GATEWAY}" sh -c \
+  "head -c 65537 /dev/urandom > /tmp/oversized-signin.bin"
+
+signin_oversized_status="$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signin \
+  -H 'X-App-Attestation: no-hace-falta-que-sea-valido' \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'Expect:' \
+  --data-binary @/tmp/oversized-signin.bin)"
+
+check "un body de 64KB+1 (> SIGNIN_MAX_BODY_KB) se rechaza" 413 "${signin_oversized_status}"
+
+signin_google_calls_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+check "el rechazo por tamaño no llega a llamar a Google" \
+  "${signin_google_calls_before}" "${signin_google_calls_after}"
 
 echo
 if (( failures > 0 )); then
