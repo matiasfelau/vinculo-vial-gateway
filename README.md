@@ -4,24 +4,29 @@ API Gateway de la plataforma **Vínculo Vial**, construido sobre **Kong 3.7 en m
 DB-less**. Es el único punto de entrada público: enruta el tráfico hacia los
 servicios internos y concentra la seguridad perimetral.
 
-Expone `POST /api/v1/auth/signup` (US-01, Registro) y `POST /api/v1/auth/signin`
-(US-02, Login) hacia `vinculo-vial-identity`, y valida **App Attestation**
-(`X-App-Attestation`, contra Google Play Integrity) en las dos antes de
-permitir tráfico hacia la red interna. El body nunca se inspecciona ni se
-modifica: viaja cifrado extremo a extremo (HPKE).
+Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
+(US-02, Login), y `POST /api/v1/auth/refresh` + `POST /api/v1/auth/logout`
+(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`. Valida **App
+Attestation** (`X-App-Attestation`, contra Google Play Integrity) en signup,
+signin y refresh antes de permitir tráfico hacia la red interna — **logout es
+la única excepción deliberada** (ver más abajo). El body de signup/signin
+viaja cifrado extremo a extremo (HPKE) y el Gateway nunca lo inspecciona ni lo
+modifica; el de refresh/logout es un Refresh Token opaco sin cifrado propio,
+cuya confidencialidad la aporta HTTPS.
 
 ## Estado
 
 | Capacidad | Estado |
 |---|---|
 | Bootstrap DB-less + logging + Status API | ✅ |
-| Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`) | ✅ |
+| Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`, `/auth/refresh`, `/auth/logout`) | ✅ |
 | Rate limiting global | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
+| `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
 | Token offloading (`X-User-Hash`) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 83 tests unitarios + 28 de integración | ✅ |
+| CI: 90 tests unitarios + 36 de integración | ✅ |
 
 ## Estructura
 
@@ -257,6 +262,42 @@ no puede pasar por tener una forma más laxa.
 
 Nunca en producción: quien tenga la PSK fabrica cualquier veredicto.
 
+## Gestión de sesión: `/auth/refresh` y `/auth/logout`
+
+Ambos endpoints reciben `{ "refresh_token": "<string opaco>" }`, de un solo
+uso — sin el sobre HPKE de signup/signin, porque la confidencialidad la aporta
+HTTPS y no hace falta cifrado adicional para un token opaco. El Gateway no
+participa de la emisión ni de la revocación: sólo enruta y, en `/refresh`,
+perimetra con `app-attestation`.
+
+| Ruta | `X-App-Attestation` | Motivo |
+|---|---|---|
+| `POST /auth/refresh` | Obligatorio | Emite un par de tokens nuevo (rotado); mismo perímetro que signup/signin |
+| `POST /auth/logout` | **No se exige** | Ver justificación abajo |
+
+### Por qué `/logout` queda exento de atestación
+
+Es una decisión deliberada, no un descuido. Cerrar sesión es una acción de
+seguridad del **usuario**: si el dispositivo perdiera su capacidad de atestar
+(o el mock, o a futuro Play Integrity real, fallara), exigir el header dejaría
+al usuario atrapado sin poder revocar su propia sesión — exactamente lo
+contrario de lo que se busca ante un robo de dispositivo. El riesgo residual
+es bajo: quien ya posee el Refresh Token sólo puede invalidarlo, lo cual no le
+da acceso a nada.
+
+Por eso `/auth/logout` responde `200` siempre, incluso si el token no existía
+o ya estaba revocado — es Identity quien implementa esa anti-enumeración; el
+Gateway simplemente no le agrega una barrera de atestación por delante.
+
+### `app-attestation` es siempre por Route, nunca por Service
+
+Si el plugin se declarara a nivel del Service `identity-service`, se
+heredaría automáticamente en **todas** sus Routes — incluida `/auth/logout`,
+que por contrato tiene que quedar exenta, y Kong no ofrece manera de
+desactivar un plugin heredado del Service en una Route puntual. Por eso es
+regla del repo: cualquier Route nueva declara explícitamente los plugins que
+necesita; declararlos a nivel de Service queda prohibido.
+
 ## Tamaño del payload
 
 El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB); el de
@@ -286,6 +327,12 @@ quedar igual o mayor al mayor de los dos techos: si el body no entra en el
 buffer, nginx lo vuelca a un archivo temporal donde `app-attestation` ya no lo
 puede leer para calcular el `requestHash`.
 
+`/auth/refresh` y `/auth/logout` no tienen un techo propio de
+`request-size-limiting`: el body es sólo un Refresh Token opaco, órdenes de
+magnitud más chico que el margen que ya deja el piso global de nginx, así que
+un techo dedicado no agrega protección real — a diferencia de signup/signin,
+donde el body sí puede acercarse al piso global.
+
 ## Rate limiting detrás de un proxy
 
 El límite global cuenta **por IP de cliente**. Si el Gateway queda detrás de un
@@ -311,9 +358,10 @@ operación entre los logs de los tres repos.
 `X-User-Hash` lo escribe **exclusivamente el Gateway**, a partir del `sub` de un
 JWT ya verificado: los servicios internos confían en él porque llega por la red
 interna. Por eso el header entrante se descarta en **todas** las rutas —
-incluidas `/auth/signup` y `/auth/signin`, que no tienen `token-offloading`—
-mediante un `request-transformer` global. Sin eso, cualquiera podría suplantar
-a otro usuario mandando el header desde afuera.
+incluidas `/auth/signup`, `/auth/signin`, `/auth/refresh` y `/auth/logout`, que
+no tienen `token-offloading`— mediante un `request-transformer` global. Sin
+eso, cualquiera podría suplantar a otro usuario mandando el header desde
+afuera.
 
 El orden de plugins que lo hace posible:
 

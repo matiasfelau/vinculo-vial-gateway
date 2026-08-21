@@ -107,6 +107,20 @@ signin_status() {
     --data-binary "${body}"
 }
 
+# Igual patrón contra /auth/refresh (US-03). A diferencia de signup/signin, el
+# body no es un sobre HPKE sino `{"refresh_token": "<opaco>"}`, pero la
+# ligadura con `app-attestation` funciona idéntico: el hash es del body crudo,
+# sea cual sea su forma.
+refresh_status() {
+  local attestation="$1" body="${2:-}"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
+    -H "X-App-Attestation: ${attestation}" \
+    -H 'Content-Type: application/json' \
+    --data-binary "${body}"
+}
+
 # SHA-256 del body en hexadecimal: lo mismo que calcula el Gateway y lo que el
 # Frontend le pasa a `setRequestHash()`.
 body_hash() {
@@ -405,6 +419,69 @@ check "un body de 64KB+1 (> SIGNIN_MAX_BODY_KB) se rechaza" 413 "${signin_oversi
 signin_google_calls_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
 check "el rechazo por tamaño no llega a llamar a Google" \
   "${signin_google_calls_before}" "${signin_google_calls_after}"
+
+echo
+echo "Refresh (US-03)"
+
+# La política de atestación en sí (ligadura, replay, veredictos, errores de
+# Google) ya está cubierta en detalle contra signup: es la misma instancia de
+# plugin. Acá sólo se verifica el contrato específico de esta Route — que el
+# header siga siendo obligatorio y que una atestación válida efectivamente
+# pase — y el contrato de la respuesta.
+
+check "sin header, 403 sin siquiera llamar a Google" \
+  403 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/refresh -d '{}')"
+
+refresh_body='{"refresh_token":"opaque-refresh-a"}'
+refresh_hash="$(body_hash "${refresh_body}")"
+
+check "atestación válida ligada al body llega al upstream" \
+  200 "$(refresh_status "${refresh_hash}" "${refresh_body}")"
+
+check "una atestación rechazada por Google se traduce en 403" \
+  403 "$(refresh_status "REJECT" '{"refresh_token":"no-importa"}')"
+
+# Body propio para este chequeo: el anti-replay ya probado más arriba
+# rechazaría un segundo uso del mismo token de la request anterior.
+refresh_body2='{"refresh_token":"opaque-refresh-b"}'
+refresh_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
+  -H "X-App-Attestation: $(body_hash "${refresh_body2}")" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${refresh_body2}")"
+
+check_contains "el body llega intacto al upstream" \
+  "opaque-refresh-b" "${refresh_upstream_view}"
+check_not_contains "el token de atestación no se propaga al upstream" \
+  "x-app-attestation" "$(printf '%s' "${refresh_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Logout (US-03): exención deliberada de atestación"
+
+# A diferencia de TODAS las demás rutas, logout tiene que pasar SIN header: si
+# exigiera atestación, un usuario con el dispositivo comprometido (o el mock
+# caído) quedaría sin poder cerrar su propia sesión — justo lo contrario de lo
+# que se busca ante un robo de dispositivo. Se manda un `X-User-Hash` de
+# prueba para confirmar que el `request-transformer` global lo descarta acá
+# también, igual que en el resto de las rutas.
+
+check "sin header de atestación pasa igual (no 403)" \
+  200 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+    -H 'Content-Type: application/json' \
+    -d '{"refresh_token":"cualquier-token"}')"
+
+logout_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+  -H 'Content-Type: application/json' \
+  -H 'X-User-Hash: intento-de-suplantacion' \
+  -d '{"refresh_token":"otro-token-distinto"}')"
+
+check_contains "el body llega intacto al upstream" \
+  "otro-token-distinto" "${logout_upstream_view}"
+check_not_contains "X-User-Hash entrante se descarta también en logout" \
+  "intento-de-suplantacion" "$(printf '%s' "${logout_upstream_view}" | tr '[:upper:]' '[:lower:]')"
 
 echo
 if (( failures > 0 )); then
