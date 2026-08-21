@@ -114,11 +114,67 @@ services:
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
 
+      # US-03 — Gestión de Sesión (RTR). El body es `{ "refresh_token": "<...>" }`,
+      # un string opaco SIN el sobre HPKE de signup/signin: la confidencialidad
+      # la aporta HTTPS, no el Gateway. Identity emite un par nuevo (Access +
+      # Refresh Token, rotado) o responde 401/403 — el Gateway no participa de
+      # esa lógica, sólo perimetra el endpoint.
+      - name: identity-refresh
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/refresh
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo perímetro que signup/signin: emitir un par de tokens de
+          # sesión nuevo amerita la misma exigencia de atestación.
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+
+      # Deliberadamente SIN `app-attestation`: cerrar sesión es una acción de
+      # seguridad del usuario, no una operación que emita credenciales nuevas.
+      # Si el dispositivo perdiera su capacidad de atestar (o el mock/Play
+      # Integrity fallara), el usuario tiene que poder revocar igual su propio
+      # Refresh Token — lo contrario lo dejaría atrapado sin poder cerrar
+      # sesión justo cuando más lo necesita (robo de dispositivo). El riesgo
+      # residual es bajo: quien ya posee el token sólo puede invalidarlo, lo
+      # cual no da acceso a nada.
+      #
+      # Regla del repo: `app-attestation` se declara siempre por Route, nunca
+      # a nivel de Service — si estuviera en `identity-service`, se heredaría
+      # también acá y no habría forma de eximir esta Route puntual.
+      - name: identity-logout
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/logout
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
-      # armado: no aplica a US-01/US-02 (signup y signin todavía no llevan
-      # Access Token entrante). El par `jwt` + `token-offloading` es el que se
-      # replica en cada endpoint autenticado de la plataforma.
+      # armado: no aplica a US-01/US-02/US-03 (signup, signin, refresh y
+      # logout se autentican con el Refresh Token o no requieren sesión,
+      # nunca con el Access Token entrante). El par `jwt` + `token-offloading`
+      # es el que se replica en cada endpoint autenticado de la plataforma.
       - name: identity-profile
         methods:
           - GET
