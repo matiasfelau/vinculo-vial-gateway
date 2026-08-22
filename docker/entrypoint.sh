@@ -15,6 +15,7 @@ RENDERED="${KONG_DECLARATIVE_CONFIG:-/tmp/kong.declarative.yml}"
 # sustituya sólo éstas: cualquier otro `$` del YAML queda intacto.
 REQUIRED_VARS=(
   IDENTITY_SERVICE_URL
+  VEHICLE_SERVICE_URL
   ATTESTATION_SOURCE
   PLAY_PACKAGE_NAME
   GOOGLE_SERVICE_ACCOUNT_PATH
