@@ -16,6 +16,7 @@ readonly GATEWAY=vv-it-gateway
 readonly STUB=vv-it-google
 readonly UPSTREAM=vv-it-upstream
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
+readonly JWT_ISSUER=vinculo-vial-identity
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -107,10 +108,68 @@ signin_status() {
     --data-binary "${body}"
 }
 
+# Igual patrón contra /auth/refresh (US-03). A diferencia de signup/signin, el
+# body no es un sobre HPKE sino `{"refresh_token": "<opaco>"}`, pero la
+# ligadura con `app-attestation` funciona idéntico: el hash es del body crudo,
+# sea cual sea su forma.
+refresh_status() {
+  local attestation="$1" body="${2:-}"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
+    -H "X-App-Attestation: ${attestation}" \
+    -H 'Content-Type: application/json' \
+    --data-binary "${body}"
+}
+
 # SHA-256 del body en hexadecimal: lo mismo que calcula el Gateway y lo que el
 # Frontend le pasa a `setRequestHash()`.
 body_hash() {
   docker exec "${GATEWAY}" sh -c "printf '%s' '$1' | sha256sum | cut -d' ' -f1"
+}
+
+# Manda un POST a /api/v1/vehicles con el Bearer token dado (vacío = sin
+# header Authorization) y devuelve el status HTTP. US-04: a diferencia de
+# signup/signin/refresh, esta Route no exige `app-attestation` — la exige
+# `jwt` + `token-offloading`.
+vehicles_status() {
+  local token="$1" body="${2:-\{\}}"
+
+  if [[ -z "${token}" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/vehicles \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/vehicles \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  fi
+}
+
+# Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
+# el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
+# service account de Google — no una reimplementación paralela del firmado.
+sign_jwt() {
+  local claims_json="$1"
+
+  docker run --rm \
+    -v "$(to_host_path "${jwt_dir}"):/keys:ro" \
+    -v "$(to_host_path "${REPO_ROOT}/kong/lib"):/opt/kong:ro" \
+    -e "VV_CLAIMS=${claims_json}" \
+    --entrypoint resty kong:3.7 -I /opt/kong -e '
+      local cjson = require "cjson.safe"
+      local jws = require "vv.jws"
+
+      local file = assert(io.open("/keys/private.pem"))
+      local private_key = file:read("*a")
+      file:close()
+
+      local claims = assert(cjson.decode(os.getenv("VV_CLAIMS")))
+      io.write(assert(jws.sign_rs256(claims, private_key)))
+    '
 }
 
 # ── Preparación ──────────────────────────────────────────────────────────────
@@ -168,15 +227,38 @@ docker run --rm -v "$(to_host_path "${sa_dir}"):/sa:ro" --entrypoint resty kong:
 ' > "${sa_dir}/google-service-account.json"
 chmod 644 "${sa_dir}/google-service-account.json"
 
+# Par RSA efímero para firmar los Access Token de sesión (US-04): la clave
+# pública sobreescribe JWT_PUBLIC_KEY del Gateway, la privada firma los JWT de
+# prueba con `sign_jwt`. Nuevo en cada corrida, igual que el service account.
+echo "==> Generando un par RSA de prueba para JWT_PUBLIC_KEY"
+jwt_dir="$(mktemp -d)"
+chmod 755 "${jwt_dir}"
+
+docker run --rm --entrypoint sh kong:3.7 -c '
+  openssl genrsa 2048 2>/dev/null
+' > "${jwt_dir}/private.pem"
+chmod 644 "${jwt_dir}/private.pem"
+
+docker run --rm -v "$(to_host_path "${jwt_dir}"):/keys:ro" --entrypoint sh kong:3.7 -c '
+  openssl rsa -in /keys/private.pem -pubout 2>/dev/null
+' > "${jwt_dir}/public.pem"
+
+# Mismo formato que documenta .env.example: saltos de línea escapados como
+# `\n` literal, para insertarse en un escalar YAML entrecomillado.
+jwt_public_key_escaped="$(awk 'BEGIN{ORS="\\n"} 1' "${jwt_dir}/public.pem")"
+
 echo "==> Levantando el Gateway"
 docker run -d --name "${GATEWAY}" --network "${NETWORK}" \
   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080" \
+  -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
   -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
   vinculo-vial-gateway:integration >/dev/null
 
 for _ in $(seq 1 30); do
@@ -405,6 +487,135 @@ check "un body de 64KB+1 (> SIGNIN_MAX_BODY_KB) se rechaza" 413 "${signin_oversi
 signin_google_calls_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
 check "el rechazo por tamaño no llega a llamar a Google" \
   "${signin_google_calls_before}" "${signin_google_calls_after}"
+
+echo
+echo "Refresh (US-03)"
+
+# La política de atestación en sí (ligadura, replay, veredictos, errores de
+# Google) ya está cubierta en detalle contra signup: es la misma instancia de
+# plugin. Acá sólo se verifica el contrato específico de esta Route — que el
+# header siga siendo obligatorio y que una atestación válida efectivamente
+# pase — y el contrato de la respuesta.
+
+check "sin header, 403 sin siquiera llamar a Google" \
+  403 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/refresh -d '{}')"
+
+refresh_body='{"refresh_token":"opaque-refresh-a"}'
+refresh_hash="$(body_hash "${refresh_body}")"
+
+check "atestación válida ligada al body llega al upstream" \
+  200 "$(refresh_status "${refresh_hash}" "${refresh_body}")"
+
+check "una atestación rechazada por Google se traduce en 403" \
+  403 "$(refresh_status "REJECT" '{"refresh_token":"no-importa"}')"
+
+# Body propio para este chequeo: el anti-replay ya probado más arriba
+# rechazaría un segundo uso del mismo token de la request anterior.
+refresh_body2='{"refresh_token":"opaque-refresh-b"}'
+refresh_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
+  -H "X-App-Attestation: $(body_hash "${refresh_body2}")" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${refresh_body2}")"
+
+check_contains "el body llega intacto al upstream" \
+  "opaque-refresh-b" "${refresh_upstream_view}"
+check_not_contains "el token de atestación no se propaga al upstream" \
+  "x-app-attestation" "$(printf '%s' "${refresh_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Logout (US-03): exención deliberada de atestación"
+
+# A diferencia de TODAS las demás rutas, logout tiene que pasar SIN header: si
+# exigiera atestación, un usuario con el dispositivo comprometido (o el mock
+# caído) quedaría sin poder cerrar su propia sesión — justo lo contrario de lo
+# que se busca ante un robo de dispositivo. Se manda un `X-User-Hash` de
+# prueba para confirmar que el `request-transformer` global lo descarta acá
+# también, igual que en el resto de las rutas.
+
+check "sin header de atestación pasa igual (no 403)" \
+  200 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+    -H 'Content-Type: application/json' \
+    -d '{"refresh_token":"cualquier-token"}')"
+
+logout_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+  -H 'Content-Type: application/json' \
+  -H 'X-User-Hash: intento-de-suplantacion' \
+  -d '{"refresh_token":"otro-token-distinto"}')"
+
+check_contains "el body llega intacto al upstream" \
+  "otro-token-distinto" "${logout_upstream_view}"
+check_not_contains "X-User-Hash entrante se descarta también en logout" \
+  "intento-de-suplantacion" "$(printf '%s' "${logout_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Vinculación de Vehículo (US-04): JWT y Token Offloading"
+
+readonly USER_SUB="b7e6c1d4-4a2f-4e9b-9c3a-6f1d2e8a9c11"
+now="$(date +%s)"
+
+vehicles_body='{"dni_enc":"cripto-para-identity","pat_enc":"cripto-para-vehicle"}'
+
+check "sin Authorization, 401 sin necesidad de un JWT" \
+  401 "$(vehicles_status "" "${vehicles_body}")"
+
+check "un Bearer que no es un JWT compacto se rechaza con 401" \
+  401 "$(vehicles_status "no-es-un-jwt" "${vehicles_body}")"
+
+expired_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${USER_SUB}\",\"exp\":$((now - 300))}")"
+check "un JWT expirado se rechaza con 401" \
+  401 "$(vehicles_status "${expired_token}" "${vehicles_body}")"
+
+wrong_issuer_token="$(sign_jwt "{\"iss\":\"otro-emisor\",\"sub\":\"${USER_SUB}\",\"exp\":$((now + 300))}")"
+check "un JWT firmado con un iss que no tiene consumer registrado se rechaza con 401" \
+  401 "$(vehicles_status "${wrong_issuer_token}" "${vehicles_body}")"
+
+valid_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${USER_SUB}\",\"exp\":$((now + 300))}")"
+check "un JWT válido, firmado y sin vencer, pasa" \
+  200 "$(vehicles_status "${valid_token}" "${vehicles_body}")"
+
+vehicles_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/vehicles \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${vehicles_body}")"
+
+check_contains "Vehicle recibe X-User-Id con el sub del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${vehicles_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el Authorization no se propaga al upstream (token offloading)" \
+  "authorization" "$(printf '%s' "${vehicles_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_contains "el body (sobre HPKE) llega intacto al upstream" \
+  "cripto-para-vehicle" "${vehicles_upstream_view}"
+
+spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/vehicles \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'X-User-Id: usuario-suplantado' \
+  -H 'Content-Type: application/json' \
+  --data-binary "${vehicles_body}")"
+
+check_contains "un X-User-Id forjado por el cliente se reemplaza por el del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el X-User-Id forjado no llega al upstream" \
+  "usuario-suplantado" "$(printf '%s' "${spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Vinculación de Vehículo (US-04): /internal/* no existe en Kong"
+
+# `/internal/verify-ownership` (Vehicle → Identity) es tráfico interno
+# directo: no hay ninguna Route en kong.yml que matchee `/internal/*`, así
+# que a través del proxy tiene que dar 404 de Kong, sin llegar a ningún
+# upstream (ni Vehicle, que no existe en este harness, ni Identity).
+check "/internal/verify-ownership no tiene Route: 404" \
+  404 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/internal/verify-ownership \
+    -H 'Content-Type: application/json' \
+    -d '{"owner_id":"x","dni_enc":"y"}')"
 
 echo
 if (( failures > 0 )); then

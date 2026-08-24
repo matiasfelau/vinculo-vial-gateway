@@ -4,24 +4,35 @@ API Gateway de la plataforma **Vínculo Vial**, construido sobre **Kong 3.7 en m
 DB-less**. Es el único punto de entrada público: enruta el tráfico hacia los
 servicios internos y concentra la seguridad perimetral.
 
-Expone `POST /api/v1/auth/signup` (US-01, Registro) y `POST /api/v1/auth/signin`
-(US-02, Login) hacia `vinculo-vial-identity`, y valida **App Attestation**
-(`X-App-Attestation`, contra Google Play Integrity) en las dos antes de
-permitir tráfico hacia la red interna. El body nunca se inspecciona ni se
-modifica: viaja cifrado extremo a extremo (HPKE).
+Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
+(US-02, Login), `POST /api/v1/auth/refresh` + `POST /api/v1/auth/logout`
+(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, y `POST
+/api/v1/vehicles` (US-04, Vinculación de Vehículo) hacia
+`vinculo-vial-vehicle`. Valida **App Attestation** (`X-App-Attestation`,
+contra Google Play Integrity) en signup, signin y refresh antes de permitir
+tráfico hacia la red interna — **logout es la única excepción deliberada**
+(ver más abajo). `/vehicles` usa un perímetro distinto: **Token Offloading**
+real — Kong verifica el Access Token (JWT RS256) y traduce el claim `sub` al
+header `X-User-Id`, para que Vehicle nunca vea ni necesite validar el JWT. El
+body de signup/signin/vehicles viaja cifrado extremo a extremo (HPKE) y el
+Gateway nunca lo inspecciona ni lo modifica; el de refresh/logout es un
+Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 
 ## Estado
 
 | Capacidad | Estado |
 |---|---|
 | Bootstrap DB-less + logging + Status API | ✅ |
-| Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`) | ✅ |
+| Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`, `/auth/refresh`, `/auth/logout`) | ✅ |
+| Ruteo declarativo a `vehicle-service` (`/vehicles`, US-04) | ✅ |
 | Rate limiting global | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
-| Token offloading (`X-User-Hash`) | ✅ |
+| `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`) | ✅ |
+| `/internal/*` sin Route en Kong (verificado con un 404 explícito) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 83 tests unitarios + 28 de integración | ✅ |
+| CI: 90 tests unitarios + 47 de integración | ✅ |
 
 ## Estructura
 
@@ -39,7 +50,7 @@ kong/
     google_oauth.lua              # service account → access token (cacheado)
     sources/google.lua            # decodeIntegrityToken (producción)
     sources/mock.lua              # veredicto firmado con PSK (CI)
-  plugins/token-offloading/       # X-User-Hash a partir del JWT ya verificado
+  plugins/token-offloading/       # X-User-Hash/X-User-Id a partir del JWT ya verificado
 docker/entrypoint.sh              # renderiza kong.yml contra el entorno
 secrets/                          # credenciales montadas — no se versiona
 spec/                             # tests Busted
@@ -257,6 +268,90 @@ no puede pasar por tener una forma más laxa.
 
 Nunca en producción: quien tenga la PSK fabrica cualquier veredicto.
 
+## Gestión de sesión: `/auth/refresh` y `/auth/logout`
+
+Ambos endpoints reciben `{ "refresh_token": "<string opaco>" }`, de un solo
+uso — sin el sobre HPKE de signup/signin, porque la confidencialidad la aporta
+HTTPS y no hace falta cifrado adicional para un token opaco. El Gateway no
+participa de la emisión ni de la revocación: sólo enruta y, en `/refresh`,
+perimetra con `app-attestation`.
+
+| Ruta | `X-App-Attestation` | Motivo |
+|---|---|---|
+| `POST /auth/refresh` | Obligatorio | Emite un par de tokens nuevo (rotado); mismo perímetro que signup/signin |
+| `POST /auth/logout` | **No se exige** | Ver justificación abajo |
+
+### Por qué `/logout` queda exento de atestación
+
+Es una decisión deliberada, no un descuido. Cerrar sesión es una acción de
+seguridad del **usuario**: si el dispositivo perdiera su capacidad de atestar
+(o el mock, o a futuro Play Integrity real, fallara), exigir el header dejaría
+al usuario atrapado sin poder revocar su propia sesión — exactamente lo
+contrario de lo que se busca ante un robo de dispositivo. El riesgo residual
+es bajo: quien ya posee el Refresh Token sólo puede invalidarlo, lo cual no le
+da acceso a nada.
+
+Por eso `/auth/logout` responde `200` siempre, incluso si el token no existía
+o ya estaba revocado — es Identity quien implementa esa anti-enumeración; el
+Gateway simplemente no le agrega una barrera de atestación por delante.
+
+### `app-attestation` es siempre por Route, nunca por Service
+
+Si el plugin se declarara a nivel del Service `identity-service`, se
+heredaría automáticamente en **todas** sus Routes — incluida `/auth/logout`,
+que por contrato tiene que quedar exenta, y Kong no ofrece manera de
+desactivar un plugin heredado del Service en una Route puntual. Por eso es
+regla del repo: cualquier Route nueva declara explícitamente los plugins que
+necesita; declararlos a nivel de Service queda prohibido.
+
+## Vinculación de Vehículo: `/vehicles` (US-04)
+
+Primer endpoint con **Token Offloading real**: en vez de un perímetro de
+atestación (como signup/signin/refresh), `/vehicles` exige sesión. El plugin
+nativo `jwt` verifica la firma RS256 del Access Token contra `JWT_PUBLIC_KEY`
+(la misma clave pública de Identity que ya se usa en el scaffold de
+`/users/me`) y `token-offloading` traduce el claim `sub` —ya validado— al
+header `X-User-Id` antes de reenviar a `vinculo-vial-vehicle`. El body es un
+sobre HPKE con **cifrado diferenciado**: `dni_enc` sólo lo puede abrir
+Identity, `pat_enc` sólo Vehicle — el Gateway no lo inspecciona ni lo
+modifica, igual que en signup/signin.
+
+| Ruta | Perímetro | Motivo |
+|---|---|---|
+| `POST /vehicles` | `jwt` + `token-offloading` | Requiere sesión activa; Vehicle nunca ve el JWT |
+
+### Anti-spoofing de `X-User-Id`
+
+Igual que con `X-User-Hash`, el header de identidad lo escribe
+**exclusivamente el Gateway**. Hay dos capas independientes que lo garantizan:
+
+1. El propio `token-offloading` hace `clear_header("X-User-Id")` **antes** de
+   derivar el valor del JWT y escribir el suyo — ver
+   `kong/plugins/token-offloading/handler.lua`. Si esto no ocurriera antes de
+   escribir el header (o no ocurriera en absoluto), un cliente podría mandar
+   su propio `X-User-Id` y, según cómo Kong resuelva headers duplicados,
+   Vehicle podría terminar vinculando un vehículo a la cuenta de otro
+   usuario.
+2. El `request-transformer` global (ver [Headers de identidad](#headers-de-identidad))
+   descarta cualquier `X-User-Id` entrante en **todas** las rutas, no sólo en
+   `/vehicles` — defensa en profundidad para el día en que otra Route use el
+   mismo header sin pasar por `token-offloading`.
+
+### `/internal/verify-ownership` no existe en Kong
+
+Vehicle llama a `POST /internal/verify-ownership` en Identity directo por red
+interna — nunca a través del Gateway. No hay, ni va a haber, ninguna Route que
+matchee `/internal/*`: una petición a ese path a través del proxy devuelve
+`404` de Kong (sin Route que la atienda), sin llegar nunca a Identity.
+Verificado explícitamente en la suite de integración.
+
+**Alcance de esta protección**: la ausencia de Route en Kong bloquea el
+acceso *desde afuera de la plataforma*, pero no aísla el endpoint *dentro* de
+la red Docker — cualquier contenedor de esa red puede llamar a Identity
+directamente. El aislamiento real (puerto interno separado y/o un secreto
+servicio a servicio) es responsabilidad de Identity, documentado en su propio
+`CLAUDE.md`. El Gateway sólo cubre la mitad perimetral del problema.
+
 ## Tamaño del payload
 
 El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB); el de
@@ -286,6 +381,12 @@ quedar igual o mayor al mayor de los dos techos: si el body no entra en el
 buffer, nginx lo vuelca a un archivo temporal donde `app-attestation` ya no lo
 puede leer para calcular el `requestHash`.
 
+`/auth/refresh` y `/auth/logout` no tienen un techo propio de
+`request-size-limiting`: el body es sólo un Refresh Token opaco, órdenes de
+magnitud más chico que el margen que ya deja el piso global de nginx, así que
+un techo dedicado no agrega protección real — a diferencia de signup/signin,
+donde el body sí puede acercarse al piso global.
+
 ## Rate limiting detrás de un proxy
 
 El límite global cuenta **por IP de cliente**. Si el Gateway queda detrás de un
@@ -308,12 +409,14 @@ operación entre los logs de los tres repos.
 
 ## Headers de identidad
 
-`X-User-Hash` lo escribe **exclusivamente el Gateway**, a partir del `sub` de un
-JWT ya verificado: los servicios internos confían en él porque llega por la red
-interna. Por eso el header entrante se descarta en **todas** las rutas —
-incluidas `/auth/signup` y `/auth/signin`, que no tienen `token-offloading`—
-mediante un `request-transformer` global. Sin eso, cualquiera podría suplantar
-a otro usuario mandando el header desde afuera.
+`X-User-Hash` (scaffold de `/users/me`) y `X-User-Id` (`/vehicles`, US-04) los
+escribe **exclusivamente el Gateway**, a partir del `sub` de un JWT ya
+verificado: los servicios internos confían en ellos porque llegan por la red
+interna. Por eso ambos headers entrantes se descartan en **todas** las
+rutas — incluidas `/auth/signup`, `/auth/signin`, `/auth/refresh` y
+`/auth/logout`, que ni siquiera tienen `token-offloading`— mediante un
+`request-transformer` global. Sin eso, cualquiera podría suplantar a otro
+usuario mandando el header desde afuera.
 
 El orden de plugins que lo hace posible:
 

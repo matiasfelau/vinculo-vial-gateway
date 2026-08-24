@@ -114,11 +114,68 @@ services:
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
 
+      # US-03 — Gestión de Sesión (RTR). El body es `{ "refresh_token": "<...>" }`,
+      # un string opaco SIN el sobre HPKE de signup/signin: la confidencialidad
+      # la aporta HTTPS, no el Gateway. Identity emite un par nuevo (Access +
+      # Refresh Token, rotado) o responde 401/403 — el Gateway no participa de
+      # esa lógica, sólo perimetra el endpoint.
+      - name: identity-refresh
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/refresh
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo perímetro que signup/signin: emitir un par de tokens de
+          # sesión nuevo amerita la misma exigencia de atestación.
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+
+      # Deliberadamente SIN `app-attestation`: cerrar sesión es una acción de
+      # seguridad del usuario, no una operación que emita credenciales nuevas.
+      # Si el dispositivo perdiera su capacidad de atestar (o el mock/Play
+      # Integrity fallara), el usuario tiene que poder revocar igual su propio
+      # Refresh Token — lo contrario lo dejaría atrapado sin poder cerrar
+      # sesión justo cuando más lo necesita (robo de dispositivo). El riesgo
+      # residual es bajo: quien ya posee el token sólo puede invalidarlo, lo
+      # cual no da acceso a nada.
+      #
+      # Regla del repo: `app-attestation` se declara siempre por Route, nunca
+      # a nivel de Service — si estuviera en `identity-service`, se heredaría
+      # también acá y no habría forma de eximir esta Route puntual.
+      - name: identity-logout
+        methods:
+          - POST
+        paths:
+          - /api/v1/auth/logout
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
-      # armado: no aplica a US-01/US-02 (signup y signin todavía no llevan
-      # Access Token entrante). El par `jwt` + `token-offloading` es el que se
-      # replica en cada endpoint autenticado de la plataforma.
+      # armado: no aplica a US-01/US-02/US-03 (signup, signin, refresh y
+      # logout se autentican con el Refresh Token o no requieren sesión,
+      # nunca con el Access Token entrante). El par `jwt` + `token-offloading`
+      # es el que se replica en cada endpoint autenticado de la plataforma —
+      # `vehicles-route` (US-04, más abajo) es el primer caso real.
       - name: identity-profile
         methods:
           - GET
@@ -144,6 +201,61 @@ services:
               claim: sub
               header_name: X-User-Hash
               remove_authorization: true
+
+  # ── vinculo-vial-vehicle ────────────────────────────────────────────────────
+  # US-04 — Vinculación de Vehículo. Primer CU con Token Offloading real: el
+  # body es un sobre HPKE con cifrado diferenciado (`dni_enc` para Identity,
+  # `pat_enc` para Vehicle) que el Gateway no inspecciona ni modifica, sólo
+  # reenvía. `/internal/verify-ownership` (Vehicle → Identity) es tráfico
+  # interno directo, nunca una Route de Kong — ver más abajo.
+  - name: vehicle-service
+    url: ${VEHICLE_SERVICE_URL}
+    connect_timeout: 5000
+    write_timeout: 15000
+    read_timeout: 15000
+    routes:
+      - name: vehicles-route
+        methods:
+          - POST
+        paths:
+          - /api/v1/vehicles
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Verifica la firma RS256 del Access Token contra la clave pública
+          # de Identity. Mismo par jwt + token-offloading que el scaffold de
+          # /users/me, ahora en su primer uso real.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          # Traduce el `sub` ya validado a `X-User-Id` y quita el
+          # `Authorization` antes de reenviar. Descarta también cualquier
+          # `X-User-Id` que venga del cliente antes de escribir el propio
+          # (kong/plugins/token-offloading/handler.lua): sin eso, un
+          # atacante podría mandar su propio `X-User-Id` y vincular un
+          # vehículo a la cuenta de otro usuario.
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+
+      # No existe ninguna Route que matchee `/internal/*`: el endpoint
+      # interno `/internal/verify-ownership` (Vehicle → Identity) no se
+      # expone en Kong a propósito, y una request a través del proxy tiene
+      # que devolver 404 de Kong, sin llegar nunca a la red interna. La
+      # ausencia de Route impide el acceso desde AFUERA, pero no aísla el
+      # endpoint dentro de la red Docker — cualquier contenedor puede
+      # llamar a Identity directamente; ese aislamiento es responsabilidad
+      # de Identity (puerto interno separado y/o secreto servicio a
+      # servicio, documentado en su propio CLAUDE.md). Kong cubre sólo la
+      # mitad perimetral del problema.
 
 # ── Consumers ────────────────────────────────────────────────────────────────
 # En este modelo el emisor de los tokens es Identity, no cada usuario final: el
@@ -173,10 +285,14 @@ plugins:
       echo_downstream: true
 
   # Los headers de identidad los escribe exclusivamente el Gateway: los
-  # servicios internos confían en `X-User-Hash` porque llega por la red
-  # interna. Si un cliente lo manda desde afuera y lo dejamos pasar, suplanta
-  # a cualquier usuario. Se descarta en TODAS las rutas, incluidas las que no
-  # tienen `token-offloading` (como signup).
+  # servicios internos confían en `X-User-Hash` / `X-User-Id` porque llegan
+  # por la red interna. Si un cliente los manda desde afuera y los dejamos
+  # pasar, suplanta a cualquier usuario. Se descartan en TODAS las rutas,
+  # incluidas las que no tienen `token-offloading` (como signup) — defensa en
+  # profundidad: `token-offloading` ya hace su propio `clear_header` antes de
+  # escribir el suyo, pero esta capa cubre también las rutas donde ese plugin
+  # ni siquiera corre. La misma limpieza preventiva se aplica a todo header
+  # de confianza interna que se introduzca en el futuro.
   # Corre en prioridad 801, después de `app-attestation` (900) y antes de
   # `token-offloading` (790), que es quien inyecta el valor legítimo.
   - name: request-transformer
@@ -184,6 +300,7 @@ plugins:
       remove:
         headers:
           - X-User-Hash
+          - X-User-Id
 
   # Rate limiting perimetral por IP de cliente. Primera línea de defensa contra
   # fuerza bruta y abuso automatizado sobre cualquier endpoint.
