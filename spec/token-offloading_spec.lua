@@ -1,6 +1,13 @@
 local handler = require "kong.plugins.token-offloading.handler"
 local token_helper = require "spec.helpers.token"
 
+-- Prioridad nativa de `rate-limiting` en Kong 3.7 (fija, no configurable
+-- desde kong.yml). US-05 usa `limit_by: header` sobre el mismo header que
+-- este plugin escribe: si algún día `PRIORITY` bajara por debajo de este
+-- valor, ese rate limiting por usuario dejaría de encontrar el header y
+-- degradaría en silencio a otro criterio de límite.
+local RATE_LIMITING_NATIVE_PRIORITY = 910
+
 -- El plugin nativo `jwt` ya verificó la firma antes de que corra este plugin:
 -- este sólo necesita un JWT bien formado del que extraer la identidad.
 
@@ -12,6 +19,12 @@ local function token(claims, header_overrides)
 end
 
 describe("token-offloading", function()
+  describe("orden de ejecución", function()
+    it("corre antes que `rate-limiting`, para que limit_by: header lo encuentre", function()
+      assert.is_true(handler.PRIORITY > RATE_LIMITING_NATIVE_PRIORITY)
+    end)
+  end)
+
   describe("extracción del claim de identidad", function()
     it("devuelve el `sub` del token validado", function()
       local value = handler.extract_claim(token({ sub = USER_HASH, exp = 1735689600 }), "sub")

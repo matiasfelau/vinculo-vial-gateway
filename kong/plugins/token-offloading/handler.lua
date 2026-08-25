@@ -13,12 +13,21 @@ local errors = require "vv.errors"
 
 local decode_base64 = ngx.decode_base64
 
--- Prioridad 790: corre después del plugin `jwt` (1450), que es quien verifica
--- la firma y deja el token validado en `ngx.ctx`, después de `app-attestation`
--- (900) y —clave— después del `request-transformer` global (801) que descarta
--- el `X-User-Hash` entrante. Si corriera antes, ese plugin borraría el header
--- que este acaba de escribir.
-local PRIORITY = 790
+-- Prioridad 1000: corre después del plugin `jwt` (1450), que es quien
+-- verifica la firma y deja el token validado en `ngx.ctx`, y ANTES de
+-- `rate-limiting` (910). Esto último es lo que importa: cuando una Route usa
+-- `rate-limiting` con `limit_by: header` sobre este mismo header (US-05), ese
+-- plugin necesita encontrarlo ya escrito cuando corre su propio `access()`; si
+-- `token-offloading` corriera después, el límite por usuario degradaría en
+-- silencio a otro criterio.
+--
+-- Esto sólo es seguro porque el header que este plugin escribe ya no puede
+-- ser pisado por nada que corra después: el `clear_header` + `set_header` de
+-- abajo son atómicos dentro de este mismo `access()`, y ninguna Route con
+-- `token-offloading` tiene además un `request-transformer` u otro plugin que
+-- vuelva a tocar este header (ver kong.yml: ese descarte ahora es sólo por
+-- Route, en las Routes que NO tienen este plugin).
+local PRIORITY = 1000
 
 -- Un identificador de usuario no tiene por qué ser largo; el techo evita que
 -- un token raro genere un header desmedido.
