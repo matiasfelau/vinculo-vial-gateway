@@ -32,7 +32,7 @@ Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 90 tests unitarios + 47 de integración | ✅ |
+| CI: 91 tests unitarios + 47 de integración | ✅ |
 
 ## Estructura
 
@@ -323,19 +323,15 @@ modifica, igual que en signup/signin.
 ### Anti-spoofing de `X-User-Id`
 
 Igual que con `X-User-Hash`, el header de identidad lo escribe
-**exclusivamente el Gateway**. Hay dos capas independientes que lo garantizan:
-
-1. El propio `token-offloading` hace `clear_header("X-User-Id")` **antes** de
-   derivar el valor del JWT y escribir el suyo — ver
-   `kong/plugins/token-offloading/handler.lua`. Si esto no ocurriera antes de
-   escribir el header (o no ocurriera en absoluto), un cliente podría mandar
-   su propio `X-User-Id` y, según cómo Kong resuelva headers duplicados,
-   Vehicle podría terminar vinculando un vehículo a la cuenta de otro
-   usuario.
-2. El `request-transformer` global (ver [Headers de identidad](#headers-de-identidad))
-   descarta cualquier `X-User-Id` entrante en **todas** las rutas, no sólo en
-   `/vehicles` — defensa en profundidad para el día en que otra Route use el
-   mismo header sin pasar por `token-offloading`.
+**exclusivamente el Gateway**: el propio `token-offloading` hace
+`clear_header("X-User-Id")` **antes** de derivar el valor del JWT y escribir
+el suyo — ver `kong/plugins/token-offloading/handler.lua`. Si esto no
+ocurriera antes de escribir el header (o no ocurriera en absoluto), un
+cliente podría mandar su propio `X-User-Id` y, según cómo Kong resuelva
+headers duplicados, Vehicle podría terminar vinculando un vehículo a la
+cuenta de otro usuario. Es la única capa en esta Route (ver
+[Headers de identidad](#headers-de-identidad) para el porqué no hay, además,
+un `request-transformer` corriendo acá).
 
 ### `/internal/verify-ownership` no existe en Kong
 
@@ -412,17 +408,36 @@ operación entre los logs de los tres repos.
 `X-User-Hash` (scaffold de `/users/me`) y `X-User-Id` (`/vehicles`, US-04) los
 escribe **exclusivamente el Gateway**, a partir del `sub` de un JWT ya
 verificado: los servicios internos confían en ellos porque llegan por la red
-interna. Por eso ambos headers entrantes se descartan en **todas** las
-rutas — incluidas `/auth/signup`, `/auth/signin`, `/auth/refresh` y
-`/auth/logout`, que ni siquiera tienen `token-offloading`— mediante un
-`request-transformer` global. Sin eso, cualquiera podría suplantar a otro
-usuario mandando el header desde afuera.
+interna. Sin eso, cualquiera podría suplantar a otro usuario mandando el
+header desde afuera. La protección se aplica en dos capas distintas, según si
+la Route tiene `token-offloading` o no:
 
-El orden de plugins que lo hace posible:
+- **Con `token-offloading`** (`/users/me`, `/vehicles`): el propio plugin
+  hace `clear_header` del header antes de escribir el suyo, en un único
+  `access()` atómico — no hace falta ni conviene sumar otro plugin encima.
+- **Sin `token-offloading`** (`/auth/signup`, `/auth/signin`,
+  `/auth/refresh`, `/auth/logout`): cada una de esas cuatro Routes declara su
+  propia instancia de `request-transformer` que descarta ambos headers
+  entrantes.
+
+Antes había una única instancia de `request-transformer` **global**, que
+cubría las cuatro rutas sin `token-offloading` con una sola declaración. Se
+reemplazó por cuatro instancias por Route porque su prioridad nativa (801)
+queda fija entre `rate-limiting` (910) y `token-offloading` — y con
+`token-offloading` corriendo a partir de US-05 en una prioridad mayor a la de
+`rate-limiting` (ver más abajo), un `request-transformer` global le habría
+borrado el header recién escrito antes de reenviarlo al upstream. Declararlo
+sólo en las rutas que de verdad lo necesitan evita el conflicto sin perder
+cobertura.
+
+El orden de plugins relevante en cada caso:
 
 ```
-rate-limiting (910) → app-attestation (900) → request-transformer (801, descarta
-el header entrante) → token-offloading (790, inyecta el verificado)
+Rutas con token-offloading (/users/me, /vehicles y, desde US-05, /vehicles/check y /alerts):
+  jwt (1450) → token-offloading (1000) → rate-limiting (910, sólo en las de US-05)
+
+Rutas sin token-offloading (signup, signin, refresh, logout):
+  rate-limiting (910) → app-attestation (900, salvo logout) → request-transformer (801, por Route)
 ```
 
 ## Contrato de error
