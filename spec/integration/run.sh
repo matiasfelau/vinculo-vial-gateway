@@ -149,6 +149,27 @@ vehicles_status() {
   fi
 }
 
+# Manda un POST a /api/v1/alerts con el Bearer token dado (vacío = sin header
+# Authorization) y devuelve el status HTTP. US-05: mismo par jwt +
+# token-offloading que vehicles_status, más rate-limiting por X-User-Id (ese
+# tercer plugin se verifica en su propia suite, no acá).
+alerts_status() {
+  local token="$1" body="${2:-\{\}}"
+
+  if [[ -z "${token}" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/alerts \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/alerts \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  fi
+}
+
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
 # el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
 # service account de Google — no una reimplementación paralela del firmado.
@@ -253,6 +274,7 @@ docker run -d --name "${GATEWAY}" --network "${NETWORK}" \
   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080" \
+  -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
@@ -616,6 +638,68 @@ check "/internal/verify-ownership no tiene Route: 404" \
     -X POST http://127.0.0.1:8000/internal/verify-ownership \
     -H 'Content-Type: application/json' \
     -d '{"owner_id":"x","dni_enc":"y"}')"
+
+echo
+echo "Escaneo de Patente (US-05): JWT y Token Offloading en /alerts"
+
+# Mismo usuario que en la sección de Vehículo: los contadores de
+# rate-limiting son por Route, así que reusar el sub no cruza cupos entre
+# /vehicles y /alerts. Cada bloque manda a lo sumo 2 requests con JWT
+# válido, muy por debajo del límite de 5/min — la verificación exhaustiva
+# del rate-limiting (sexto request -> 429, cupos independientes por
+# usuario) es una suite aparte.
+alerts_body='{"alert_type":"exceso_de_velocidad","pat_enc":"cripto-para-vehicle"}'
+
+check "sin Authorization, 401 sin necesidad de un JWT" \
+  401 "$(alerts_status "" "${alerts_body}")"
+
+alerts_expired_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${USER_SUB}\",\"exp\":$((now - 300))}")"
+check "un JWT expirado se rechaza con 401" \
+  401 "$(alerts_status "${alerts_expired_token}" "${alerts_body}")"
+
+check "un JWT válido, firmado y sin vencer, pasa" \
+  200 "$(alerts_status "${valid_token}" "${alerts_body}")"
+
+alerts_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/alerts \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${alerts_body}")"
+
+check_contains "Alert recibe X-User-Id con el sub del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${alerts_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el Authorization no se propaga al upstream (token offloading)" \
+  "authorization" "$(printf '%s' "${alerts_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_contains "el body (alert_type + sobre HPKE) llega intacto al upstream" \
+  "exceso_de_velocidad" "${alerts_upstream_view}"
+check_contains "el criptograma de la patente llega intacto al upstream" \
+  "cripto-para-vehicle" "${alerts_upstream_view}"
+
+alerts_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/alerts \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'X-User-Id: usuario-suplantado' \
+  -H 'Content-Type: application/json' \
+  --data-binary "${alerts_body}")"
+
+check_contains "un X-User-Id forjado por el cliente se reemplaza por el del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${alerts_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el X-User-Id forjado no llega al upstream" \
+  "usuario-suplantado" "$(printf '%s' "${alerts_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Escaneo de Patente (US-05): /internal/* no existe en Kong"
+
+# `/internal/resolve-owner` (Alert → Vehicle) es tráfico interno directo:
+# no hay ninguna Route en kong.yml que matchee `/internal/*`, así que a
+# través del proxy tiene que dar 404 de Kong.
+check "/internal/resolve-owner no tiene Route: 404" \
+  404 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/internal/resolve-owner \
+    -H 'Content-Type: application/json' \
+    -d '{"pat_enc":"cripto-para-vehicle"}')"
 
 echo
 if (( failures > 0 )); then
