@@ -6,15 +6,20 @@ servicios internos y concentra la seguridad perimetral.
 
 Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
 (US-02, Login), `POST /api/v1/auth/refresh` + `POST /api/v1/auth/logout`
-(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, y `POST
+(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, `POST
 /api/v1/vehicles` (US-04, Vinculación de Vehículo) hacia
-`vinculo-vial-vehicle`. Valida **App Attestation** (`X-App-Attestation`,
-contra Google Play Integrity) en signup, signin y refresh antes de permitir
-tráfico hacia la red interna — **logout es la única excepción deliberada**
-(ver más abajo). `/vehicles` usa un perímetro distinto: **Token Offloading**
-real — Kong verifica el Access Token (JWT RS256) y traduce el claim `sub` al
-header `X-User-Id`, para que Vehicle nunca vea ni necesite validar el JWT. El
-body de signup/signin/vehicles viaja cifrado extremo a extremo (HPKE) y el
+`vinculo-vial-vehicle`, y `POST /api/v1/alerts` (US-05, Escaneo de Patente y
+Alerta Anónima) hacia `vinculo-vial-alert`. Valida **App Attestation**
+(`X-App-Attestation`, contra Google Play Integrity) en signup, signin y
+refresh antes de permitir tráfico hacia la red interna — **logout es la
+única excepción deliberada** (ver más abajo). `/vehicles` y `/alerts` usan un
+perímetro distinto: **Token Offloading** real — Kong verifica el Access
+Token (JWT RS256) y traduce el claim `sub` al header `X-User-Id`, para que
+el upstream nunca vea ni necesite validar el JWT. `/alerts` no tiene
+`app-attestation` (decisión cerrada del contrato de US-05, por velocidad) y
+se apoya en cambio en **rate limiting por usuario** (5/min, 10/hora sobre
+`X-User-Id`) como control de seguridad, no como cortesía operativa. El body
+de signup/signin/vehicles/alerts viaja cifrado extremo a extremo (HPKE) y el
 Gateway nunca lo inspecciona ni lo modifica; el de refresh/logout es un
 Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 
@@ -25,14 +30,17 @@ Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 | Bootstrap DB-less + logging + Status API | ✅ |
 | Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`, `/auth/refresh`, `/auth/logout`) | ✅ |
 | Ruteo declarativo a `vehicle-service` (`/vehicles`, US-04) | ✅ |
+| Ruteo declarativo a `alert-service` (`/alerts`, US-05) | ✅ |
 | Rate limiting global | ✅ |
+| Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`) | ✅ |
-| `/internal/*` sin Route en Kong (verificado con un 404 explícito) | ✅ |
+| `/alerts` exento de atestación (decisión cerrada del contrato US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` y `/alerts`) | ✅ |
+| `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle y Alert) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 91 tests unitarios + 47 de integración | ✅ |
+| CI: 91 tests unitarios + 57 de integración | ✅ |
 
 ## Estructura
 
@@ -50,7 +58,7 @@ kong/
     google_oauth.lua              # service account → access token (cacheado)
     sources/google.lua            # decodeIntegrityToken (producción)
     sources/mock.lua              # veredicto firmado con PSK (CI)
-  plugins/token-offloading/       # X-User-Hash/X-User-Id a partir del JWT ya verificado
+  plugins/token-offloading/       # X-User-Hash/X-User-Id a partir del JWT ya verificado, PRIORITY=1000
 docker/entrypoint.sh              # renderiza kong.yml contra el entorno
 secrets/                          # credenciales montadas — no se versiona
 spec/                             # tests Busted
@@ -377,6 +385,51 @@ la red Docker — cualquier contenedor de esa red puede llamar a Identity
 directamente. El aislamiento real (puerto interno separado y/o un secreto
 servicio a servicio) es responsabilidad de Identity, documentado en su propio
 `CLAUDE.md`. El Gateway sólo cubre la mitad perimetral del problema.
+
+## Escaneo de Patente: `/alerts` (US-05)
+
+Mismo perímetro base que `/vehicles`: `jwt` verifica el Access Token y
+`token-offloading` traduce el `sub` a `X-User-Id` antes de reenviar a
+`vinculo-vial-alert`. La diferencia es que esta Route **no lleva
+`app-attestation`** — decisión cerrada del contrato de US-05, por
+velocidad — y en su lugar suma `rate-limiting` **por usuario**, mucho más
+estricto que el límite global por IP:
+
+| Ruta | Perímetro | Límite por usuario |
+|---|---|---|
+| `POST /alerts` | `jwt` + `token-offloading` + `rate-limiting` | 5/min, 10/hora sobre `X-User-Id` |
+
+### Por qué el rate limiting acá es un control de seguridad, no una cortesía
+
+Sin `app-attestation`, cualquiera con un Access Token válido puede llamar a
+este endpoint: no hay una segunda señal (dispositivo/app legítima) que
+filtre tráfico automatizado. El `rate-limiting` por `X-User-Id` es la
+**única** defensa contra un uso abusivo de la alerta anónima (spam, barrido
+de patentes ajenas disfrazado de alertas). Por eso el límite es
+significativamente más bajo que el global por IP, y por qué el orden de
+plugins que lo sostiene es crítico:
+
+```
+jwt (1450) → token-offloading (1000) → rate-limiting (910, limit_by: header)
+```
+
+Si `token-offloading` corriera después de `rate-limiting` (como corría antes
+de la corrección de prioridad — ver [Headers de identidad](#headers-de-identidad)),
+`X-User-Id` todavía no existiría cuando `rate-limiting` intenta leerlo, y el
+límite por usuario degradaría en silencio a otro criterio, dejando el
+anti-abuso sin efecto real.
+
+### `/internal/resolve-owner` no existe en Kong
+
+Mismo esquema que Vehicle: Alert llama a `POST /internal/resolve-owner` en
+Vehicle directo por red interna — Vehicle responde con `{"owner_ids": [...]}`
+(un array, la relación es 1 patente → N dueños) y Alert nunca abre el
+criptograma `pat_enc` que reenvía, porque no posee la clave privada de
+Vehicle. No hay, ni va a haber, ninguna Route que matchee `/internal/*`: una
+petición a ese path a través del proxy devuelve `404` de Kong. Verificado
+explícitamente en la suite de integración. El mismo alcance limitado que en
+Vehicle aplica acá: Kong bloquea el acceso desde afuera de la plataforma,
+pero no aísla el endpoint dentro de la red Docker.
 
 ## Tamaño del payload
 
