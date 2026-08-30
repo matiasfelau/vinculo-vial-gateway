@@ -66,6 +66,10 @@ testea una sola vez, sirva el veredicto Google o el mock.
 ## Puesta en marcha
 
 ```bash
+# Una sola vez por host, antes del primer `docker compose up` de CUALQUIER
+# componente de la plataforma (ver "Nomenclatura Docker" más abajo):
+docker network create vinculo-vial
+
 cp .env.example .env      # completar, sobre todo APP_ATTESTATION_PSK
 docker compose up --build
 ```
@@ -80,45 +84,71 @@ era el healthcheck, y para eso alcanza el Status API. Apagarla elimina la
 superficie en vez de depender de que quien despliegue se acuerde de no publicar
 el puerto.
 
-El Gateway crea y se conecta a la red Docker `vinculo-vial`, compartida con el
-resto de los componentes, y alcanza a Identity en `IDENTITY_SERVICE_URL`
+El Gateway se conecta a la red Docker **externa** `vinculo-vial` — no la crea
+él: es la red puente que comparte toda la plataforma, provista una única vez
+fuera de cualquier compose individual (ver el bootstrap de arriba). Ahí
+alcanza a Identity en `IDENTITY_SERVICE_URL`
 (`http://vinculo-vial-identity:8080` por defecto).
 
-> **Identity tiene que unirse a esa red y anunciarse con el alias
-> `vinculo-vial-identity`.** En su compose el servicio se llama `identity`, y
-> `vinculo-vial-identity` es el nombre del *proyecto* — que no es un hostname
-> resolvible. Sin el alias, Kong devuelve `503` con
-> `dns server error: 3 name error` aunque Identity esté perfectamente sano.
-> El bloque que va en el compose de Identity:
+> **Cada componente de la plataforma tiene que declarar esa misma red como
+> `external: true` y unirse a ella con un `container_name` de la forma
+> `vinculo-vial-<servicio>`** (ver "Nomenclatura Docker", más abajo). Con eso
+> alcanza: Docker resuelve el `container_name` como hostname en cualquier red
+> puente compartida, sin necesidad de un alias manual. El bloque que va en el
+> compose de cada componente:
 >
 > ```yaml
 > networks:
 >   vinculo-vial:
->     external: true          # la crea el compose del Gateway; levantarlo primero
+>     external: true
 >
 > services:
->   identity:
+>   identity:                        # el nombre del servicio en SU compose
+>     container_name: vinculo-vial-identity
 >     networks:
->       default:               # para hablar con su propia base de datos
+>       default:                     # para hablar con su propia base de datos
 >       vinculo-vial:
->         aliases:
->           - vinculo-vial-identity
 > ```
 >
-> Para destrabar sin tocar el compose de Identity, sobre los contenedores ya
-> corriendo:
+> **Si un componente todavía no migró** y sólo se anuncia con el nombre corto
+> de su servicio (p. ej. `identity`), Kong devuelve `503` con
+> `dns server error: 3 name error` aunque esté perfectamente sano. Para
+> destrabar sin tocar su compose, sobre el contenedor ya corriendo:
 >
 > ```bash
 > docker network connect --alias vinculo-vial-identity \
->   vinculo-vial vinculo-vial-identity-identity-1
+>   vinculo-vial <nombre-real-del-contenedor>
 > ```
 >
-> Es efímero: se pierde en cuanto Compose recree el contenedor.
+> Es efímero: se pierde en cuanto Compose recree ese contenedor. Es un
+> parche, no el estado final — la solución real es que ese componente migre
+> a `container_name: vinculo-vial-<servicio>`.
 
 El `kong.yml` versionado es una **plantilla**: el entrypoint resuelve los
 `${VARIABLE}` contra el entorno en cada arranque, valida el resultado con
 `kong config parse` y recién ahí levanta Kong. Si falta una variable requerida,
 el contenedor falla de entrada con el nombre de la que falta (nunca su valor).
+
+### Nomenclatura Docker (convención de plataforma)
+
+Convención obligatoria para la infraestructura Docker de los cuatro
+componentes, para eliminar la resolución de DNS inconsistente entre
+microservicios:
+
+| Regla | En este repo |
+|---|---|
+| Contenedor principal: `vinculo-vial-<servicio>` | Ya cumplía: `container_name: vinculo-vial-gateway` |
+| Contenedores secundarios (DB/broker): `vinculo-vial-<nombre>-db` / `vinculo-vial-<tecnología>` | No aplica: el Gateway es DB-less, sin contenedores propios además del suyo |
+| Red global `vinculo-vial`, `external: true` | Corregido en este cambio: antes la creaba este compose (ver más abajo) |
+| Red interna `<servicio>-internal` para el tráfico con su DB | No aplica: no hay DB propia que aislar |
+| Volúmenes persistentes: `vinculo-vial-<nombre>-data` | No aplica: no hay volúmenes con nombre, sólo el bind mount de `./secrets` |
+
+El único ajuste real fue la red: antes de este cambio, `docker-compose.yml`
+**creaba** `vinculo-vial` (sin `external: true`), lo que dependía de que el
+Gateway fuera el primer componente en levantarse y dejaba a los demás
+adivinando quién era el dueño de la red. Ahora ningún compose la crea: se
+provisiona una única vez por host (ver "Puesta en marcha") y todo componente
+—Gateway incluido— se conecta a ella como recurso externo.
 
 ## Tests
 
