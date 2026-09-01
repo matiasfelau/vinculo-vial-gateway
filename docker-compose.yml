@@ -2,8 +2,13 @@
 # Un único servicio: Kong en modo DB-less.
 #
 # No hay Postgres (DB-less no lo necesita) ni RabbitMQ (el Gateway no publica
-# ni consume eventos). La red `vinculo-vial` es la que comparten los demás
-# componentes de la plataforma, y es por donde el Gateway alcanza a Identity.
+# ni consume eventos): no hay contenedores secundarios ni volúmenes
+# persistentes que nombrar en este repo.
+#
+# La red `vinculo-vial` es la red puente compartida por toda la plataforma —
+# NINGÚN repo la crea desde su propio compose (`external: true`): existe de
+# antemano en el host, provista una única vez fuera de cualquier compose
+# individual (ver "Puesta en marcha" en el README para el bootstrap local).
 # ─────────────────────────────────────────────────────────────────────────────
 name: vinculo-vial-gateway
 
@@ -38,5 +43,11 @@ services:
       - vinculo-vial
 
 networks:
+  # Externa: este compose se conecta a la red de la plataforma, no la crea.
+  # Si no existe todavía en el host, `docker compose up` falla explícitamente
+  # ("network vinculo-vial declared as external, but could not be found") en
+  # vez de crear una red aislada con el mismo nombre por accidente — que es
+  # justamente la inconsistencia que esta convención busca eliminar.
   vinculo-vial:
     name: vinculo-vial
+    external: true

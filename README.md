@@ -6,15 +6,20 @@ servicios internos y concentra la seguridad perimetral.
 
 Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
 (US-02, Login), `POST /api/v1/auth/refresh` + `POST /api/v1/auth/logout`
-(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, y `POST
+(US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, `POST
 /api/v1/vehicles` (US-04, Vinculación de Vehículo) hacia
-`vinculo-vial-vehicle`. Valida **App Attestation** (`X-App-Attestation`,
-contra Google Play Integrity) en signup, signin y refresh antes de permitir
-tráfico hacia la red interna — **logout es la única excepción deliberada**
-(ver más abajo). `/vehicles` usa un perímetro distinto: **Token Offloading**
-real — Kong verifica el Access Token (JWT RS256) y traduce el claim `sub` al
-header `X-User-Id`, para que Vehicle nunca vea ni necesite validar el JWT. El
-body de signup/signin/vehicles viaja cifrado extremo a extremo (HPKE) y el
+`vinculo-vial-vehicle`, y `POST /api/v1/alerts` (US-05, Escaneo de Patente y
+Alerta Anónima) hacia `vinculo-vial-alert`. Valida **App Attestation**
+(`X-App-Attestation`, contra Google Play Integrity) en signup, signin y
+refresh antes de permitir tráfico hacia la red interna — **logout es la
+única excepción deliberada** (ver más abajo). `/vehicles` y `/alerts` usan un
+perímetro distinto: **Token Offloading** real — Kong verifica el Access
+Token (JWT RS256) y traduce el claim `sub` al header `X-User-Id`, para que
+el upstream nunca vea ni necesite validar el JWT. `/alerts` no tiene
+`app-attestation` (decisión cerrada del contrato de US-05, por velocidad) y
+se apoya en cambio en **rate limiting por usuario** (5/min, 10/hora sobre
+`X-User-Id`) como control de seguridad, no como cortesía operativa. El body
+de signup/signin/vehicles/alerts viaja cifrado extremo a extremo (HPKE) y el
 Gateway nunca lo inspecciona ni lo modifica; el de refresh/logout es un
 Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 
@@ -25,14 +30,17 @@ Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 | Bootstrap DB-less + logging + Status API | ✅ |
 | Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`, `/auth/refresh`, `/auth/logout`) | ✅ |
 | Ruteo declarativo a `vehicle-service` (`/vehicles`, US-04) | ✅ |
+| Ruteo declarativo a `alert-service` (`/alerts`, US-05) | ✅ |
 | Rate limiting global | ✅ |
+| Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`) | ✅ |
-| `/internal/*` sin Route en Kong (verificado con un 404 explícito) | ✅ |
+| `/alerts` exento de atestación (decisión cerrada del contrato US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` y `/alerts`) | ✅ |
+| `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle y Alert) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 90 tests unitarios + 47 de integración | ✅ |
+| CI: 91 tests unitarios + 57 de integración | ✅ |
 
 ## Estructura
 
@@ -50,7 +58,7 @@ kong/
     google_oauth.lua              # service account → access token (cacheado)
     sources/google.lua            # decodeIntegrityToken (producción)
     sources/mock.lua              # veredicto firmado con PSK (CI)
-  plugins/token-offloading/       # X-User-Hash/X-User-Id a partir del JWT ya verificado
+  plugins/token-offloading/       # X-User-Hash/X-User-Id a partir del JWT ya verificado, PRIORITY=1000
 docker/entrypoint.sh              # renderiza kong.yml contra el entorno
 secrets/                          # credenciales montadas — no se versiona
 spec/                             # tests Busted
@@ -66,6 +74,10 @@ testea una sola vez, sirva el veredicto Google o el mock.
 ## Puesta en marcha
 
 ```bash
+# Una sola vez por host, antes del primer `docker compose up` de CUALQUIER
+# componente de la plataforma (ver "Nomenclatura Docker" más abajo):
+docker network create vinculo-vial
+
 cp .env.example .env      # completar, sobre todo APP_ATTESTATION_PSK
 docker compose up --build
 ```
@@ -80,45 +92,71 @@ era el healthcheck, y para eso alcanza el Status API. Apagarla elimina la
 superficie en vez de depender de que quien despliegue se acuerde de no publicar
 el puerto.
 
-El Gateway crea y se conecta a la red Docker `vinculo-vial`, compartida con el
-resto de los componentes, y alcanza a Identity en `IDENTITY_SERVICE_URL`
+El Gateway se conecta a la red Docker **externa** `vinculo-vial` — no la crea
+él: es la red puente que comparte toda la plataforma, provista una única vez
+fuera de cualquier compose individual (ver el bootstrap de arriba). Ahí
+alcanza a Identity en `IDENTITY_SERVICE_URL`
 (`http://vinculo-vial-identity:8080` por defecto).
 
-> **Identity tiene que unirse a esa red y anunciarse con el alias
-> `vinculo-vial-identity`.** En su compose el servicio se llama `identity`, y
-> `vinculo-vial-identity` es el nombre del *proyecto* — que no es un hostname
-> resolvible. Sin el alias, Kong devuelve `503` con
-> `dns server error: 3 name error` aunque Identity esté perfectamente sano.
-> El bloque que va en el compose de Identity:
+> **Cada componente de la plataforma tiene que declarar esa misma red como
+> `external: true` y unirse a ella con un `container_name` de la forma
+> `vinculo-vial-<servicio>`** (ver "Nomenclatura Docker", más abajo). Con eso
+> alcanza: Docker resuelve el `container_name` como hostname en cualquier red
+> puente compartida, sin necesidad de un alias manual. El bloque que va en el
+> compose de cada componente:
 >
 > ```yaml
 > networks:
 >   vinculo-vial:
->     external: true          # la crea el compose del Gateway; levantarlo primero
+>     external: true
 >
 > services:
->   identity:
+>   identity:                        # el nombre del servicio en SU compose
+>     container_name: vinculo-vial-identity
 >     networks:
->       default:               # para hablar con su propia base de datos
+>       default:                     # para hablar con su propia base de datos
 >       vinculo-vial:
->         aliases:
->           - vinculo-vial-identity
 > ```
 >
-> Para destrabar sin tocar el compose de Identity, sobre los contenedores ya
-> corriendo:
+> **Si un componente todavía no migró** y sólo se anuncia con el nombre corto
+> de su servicio (p. ej. `identity`), Kong devuelve `503` con
+> `dns server error: 3 name error` aunque esté perfectamente sano. Para
+> destrabar sin tocar su compose, sobre el contenedor ya corriendo:
 >
 > ```bash
 > docker network connect --alias vinculo-vial-identity \
->   vinculo-vial vinculo-vial-identity-identity-1
+>   vinculo-vial <nombre-real-del-contenedor>
 > ```
 >
-> Es efímero: se pierde en cuanto Compose recree el contenedor.
+> Es efímero: se pierde en cuanto Compose recree ese contenedor. Es un
+> parche, no el estado final — la solución real es que ese componente migre
+> a `container_name: vinculo-vial-<servicio>`.
 
 El `kong.yml` versionado es una **plantilla**: el entrypoint resuelve los
 `${VARIABLE}` contra el entorno en cada arranque, valida el resultado con
 `kong config parse` y recién ahí levanta Kong. Si falta una variable requerida,
 el contenedor falla de entrada con el nombre de la que falta (nunca su valor).
+
+### Nomenclatura Docker (convención de plataforma)
+
+Convención obligatoria para la infraestructura Docker de los cuatro
+componentes, para eliminar la resolución de DNS inconsistente entre
+microservicios:
+
+| Regla | En este repo |
+|---|---|
+| Contenedor principal: `vinculo-vial-<servicio>` | Ya cumplía: `container_name: vinculo-vial-gateway` |
+| Contenedores secundarios (DB/broker): `vinculo-vial-<nombre>-db` / `vinculo-vial-<tecnología>` | No aplica: el Gateway es DB-less, sin contenedores propios además del suyo |
+| Red global `vinculo-vial`, `external: true` | Corregido en este cambio: antes la creaba este compose (ver más abajo) |
+| Red interna `<servicio>-internal` para el tráfico con su DB | No aplica: no hay DB propia que aislar |
+| Volúmenes persistentes: `vinculo-vial-<nombre>-data` | No aplica: no hay volúmenes con nombre, sólo el bind mount de `./secrets` |
+
+El único ajuste real fue la red: antes de este cambio, `docker-compose.yml`
+**creaba** `vinculo-vial` (sin `external: true`), lo que dependía de que el
+Gateway fuera el primer componente en levantarse y dejaba a los demás
+adivinando quién era el dueño de la red. Ahora ningún compose la crea: se
+provisiona una única vez por host (ver "Puesta en marcha") y todo componente
+—Gateway incluido— se conecta a ella como recurso externo.
 
 ## Tests
 
@@ -323,19 +361,15 @@ modifica, igual que en signup/signin.
 ### Anti-spoofing de `X-User-Id`
 
 Igual que con `X-User-Hash`, el header de identidad lo escribe
-**exclusivamente el Gateway**. Hay dos capas independientes que lo garantizan:
-
-1. El propio `token-offloading` hace `clear_header("X-User-Id")` **antes** de
-   derivar el valor del JWT y escribir el suyo — ver
-   `kong/plugins/token-offloading/handler.lua`. Si esto no ocurriera antes de
-   escribir el header (o no ocurriera en absoluto), un cliente podría mandar
-   su propio `X-User-Id` y, según cómo Kong resuelva headers duplicados,
-   Vehicle podría terminar vinculando un vehículo a la cuenta de otro
-   usuario.
-2. El `request-transformer` global (ver [Headers de identidad](#headers-de-identidad))
-   descarta cualquier `X-User-Id` entrante en **todas** las rutas, no sólo en
-   `/vehicles` — defensa en profundidad para el día en que otra Route use el
-   mismo header sin pasar por `token-offloading`.
+**exclusivamente el Gateway**: el propio `token-offloading` hace
+`clear_header("X-User-Id")` **antes** de derivar el valor del JWT y escribir
+el suyo — ver `kong/plugins/token-offloading/handler.lua`. Si esto no
+ocurriera antes de escribir el header (o no ocurriera en absoluto), un
+cliente podría mandar su propio `X-User-Id` y, según cómo Kong resuelva
+headers duplicados, Vehicle podría terminar vinculando un vehículo a la
+cuenta de otro usuario. Es la única capa en esta Route (ver
+[Headers de identidad](#headers-de-identidad) para el porqué no hay, además,
+un `request-transformer` corriendo acá).
 
 ### `/internal/verify-ownership` no existe en Kong
 
@@ -351,6 +385,51 @@ la red Docker — cualquier contenedor de esa red puede llamar a Identity
 directamente. El aislamiento real (puerto interno separado y/o un secreto
 servicio a servicio) es responsabilidad de Identity, documentado en su propio
 `CLAUDE.md`. El Gateway sólo cubre la mitad perimetral del problema.
+
+## Escaneo de Patente: `/alerts` (US-05)
+
+Mismo perímetro base que `/vehicles`: `jwt` verifica el Access Token y
+`token-offloading` traduce el `sub` a `X-User-Id` antes de reenviar a
+`vinculo-vial-alert`. La diferencia es que esta Route **no lleva
+`app-attestation`** — decisión cerrada del contrato de US-05, por
+velocidad — y en su lugar suma `rate-limiting` **por usuario**, mucho más
+estricto que el límite global por IP:
+
+| Ruta | Perímetro | Límite por usuario |
+|---|---|---|
+| `POST /alerts` | `jwt` + `token-offloading` + `rate-limiting` | 5/min, 10/hora sobre `X-User-Id` |
+
+### Por qué el rate limiting acá es un control de seguridad, no una cortesía
+
+Sin `app-attestation`, cualquiera con un Access Token válido puede llamar a
+este endpoint: no hay una segunda señal (dispositivo/app legítima) que
+filtre tráfico automatizado. El `rate-limiting` por `X-User-Id` es la
+**única** defensa contra un uso abusivo de la alerta anónima (spam, barrido
+de patentes ajenas disfrazado de alertas). Por eso el límite es
+significativamente más bajo que el global por IP, y por qué el orden de
+plugins que lo sostiene es crítico:
+
+```
+jwt (1450) → token-offloading (1000) → rate-limiting (910, limit_by: header)
+```
+
+Si `token-offloading` corriera después de `rate-limiting` (como corría antes
+de la corrección de prioridad — ver [Headers de identidad](#headers-de-identidad)),
+`X-User-Id` todavía no existiría cuando `rate-limiting` intenta leerlo, y el
+límite por usuario degradaría en silencio a otro criterio, dejando el
+anti-abuso sin efecto real.
+
+### `/internal/resolve-owner` no existe en Kong
+
+Mismo esquema que Vehicle: Alert llama a `POST /internal/resolve-owner` en
+Vehicle directo por red interna — Vehicle responde con `{"owner_ids": [...]}`
+(un array, la relación es 1 patente → N dueños) y Alert nunca abre el
+criptograma `pat_enc` que reenvía, porque no posee la clave privada de
+Vehicle. No hay, ni va a haber, ninguna Route que matchee `/internal/*`: una
+petición a ese path a través del proxy devuelve `404` de Kong. Verificado
+explícitamente en la suite de integración. El mismo alcance limitado que en
+Vehicle aplica acá: Kong bloquea el acceso desde afuera de la plataforma,
+pero no aísla el endpoint dentro de la red Docker.
 
 ## Tamaño del payload
 
@@ -412,17 +491,36 @@ operación entre los logs de los tres repos.
 `X-User-Hash` (scaffold de `/users/me`) y `X-User-Id` (`/vehicles`, US-04) los
 escribe **exclusivamente el Gateway**, a partir del `sub` de un JWT ya
 verificado: los servicios internos confían en ellos porque llegan por la red
-interna. Por eso ambos headers entrantes se descartan en **todas** las
-rutas — incluidas `/auth/signup`, `/auth/signin`, `/auth/refresh` y
-`/auth/logout`, que ni siquiera tienen `token-offloading`— mediante un
-`request-transformer` global. Sin eso, cualquiera podría suplantar a otro
-usuario mandando el header desde afuera.
+interna. Sin eso, cualquiera podría suplantar a otro usuario mandando el
+header desde afuera. La protección se aplica en dos capas distintas, según si
+la Route tiene `token-offloading` o no:
 
-El orden de plugins que lo hace posible:
+- **Con `token-offloading`** (`/users/me`, `/vehicles`): el propio plugin
+  hace `clear_header` del header antes de escribir el suyo, en un único
+  `access()` atómico — no hace falta ni conviene sumar otro plugin encima.
+- **Sin `token-offloading`** (`/auth/signup`, `/auth/signin`,
+  `/auth/refresh`, `/auth/logout`): cada una de esas cuatro Routes declara su
+  propia instancia de `request-transformer` que descarta ambos headers
+  entrantes.
+
+Antes había una única instancia de `request-transformer` **global**, que
+cubría las cuatro rutas sin `token-offloading` con una sola declaración. Se
+reemplazó por cuatro instancias por Route porque su prioridad nativa (801)
+queda fija entre `rate-limiting` (910) y `token-offloading` — y con
+`token-offloading` corriendo a partir de US-05 en una prioridad mayor a la de
+`rate-limiting` (ver más abajo), un `request-transformer` global le habría
+borrado el header recién escrito antes de reenviarlo al upstream. Declararlo
+sólo en las rutas que de verdad lo necesitan evita el conflicto sin perder
+cobertura.
+
+El orden de plugins relevante en cada caso:
 
 ```
-rate-limiting (910) → app-attestation (900) → request-transformer (801, descarta
-el header entrante) → token-offloading (790, inyecta el verificado)
+Rutas con token-offloading (/users/me, /vehicles y, desde US-05, /vehicles/check y /alerts):
+  jwt (1450) → token-offloading (1000) → rate-limiting (910, sólo en las de US-05)
+
+Rutas sin token-offloading (signup, signin, refresh, logout):
+  rate-limiting (910) → app-attestation (900, salvo logout) → request-transformer (801, por Route)
 ```
 
 ## Contrato de error

@@ -55,6 +55,23 @@ services:
               size_unit: megabytes
               require_content_length: false
 
+          # Esta Route no tiene `token-offloading`, así que nada más
+          # descartaría un `X-User-Hash`/`X-User-Id` que un cliente mande
+          # desde afuera — ver "Headers de identidad" en el README. Antes
+          # era un `request-transformer` global (una sola instancia para
+          # toda la plataforma); pasó a declararse por Route, igual que el
+          # resto de los plugins, porque un global corría en prioridad 801,
+          # entre `rate-limiting` (910) y `token-offloading`, y esa posición
+          # fija impedía subir la prioridad de `token-offloading` por encima
+          # de `rate-limiting` sin que este plugin le borrara el header
+          # recién escrito antes de reenviar al upstream (US-05).
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+
           # Seguridad perimetral: sin una atestación válida de Play Integrity
           # la request no alcanza la red interna.
           - name: app-attestation
@@ -97,6 +114,16 @@ services:
               size_unit: kilobytes
               require_content_length: false
 
+          # Igual que en signup: sin `token-offloading`, esta Route necesita
+          # su propio descarte de `X-User-Hash`/`X-User-Id` (ver comentario
+          # equivalente en `identity-signup`, más arriba).
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+
           # Mismo perímetro que signup: el login es, si no más, un blanco
           # igual de natural de fuerza bruta y credential stuffing, y encima
           # es el endpoint que primero emite tokens de sesión.
@@ -130,6 +157,16 @@ services:
           - http
           - https
         plugins:
+          # Igual que en signup/signin: sin `token-offloading`, esta Route
+          # necesita su propio descarte de `X-User-Hash`/`X-User-Id` (ver
+          # comentario equivalente en `identity-signup`, más arriba).
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+
           # Mismo perímetro que signup/signin: emitir un par de tokens de
           # sesión nuevo amerita la misma exigencia de atestación.
           - name: app-attestation
@@ -168,6 +205,16 @@ services:
         protocols:
           - http
           - https
+        plugins:
+          # Sin `app-attestation` pero igual sin `token-offloading`: sigue
+          # necesitando su propio descarte de `X-User-Hash`/`X-User-Id` (ver
+          # comentario equivalente en `identity-signup`, más arriba).
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
 
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
@@ -235,11 +282,13 @@ services:
                 - exp
               run_on_preflight: true
           # Traduce el `sub` ya validado a `X-User-Id` y quita el
-          # `Authorization` antes de reenviar. Descarta también cualquier
-          # `X-User-Id` que venga del cliente antes de escribir el propio
-          # (kong/plugins/token-offloading/handler.lua): sin eso, un
-          # atacante podría mandar su propio `X-User-Id` y vincular un
-          # vehículo a la cuenta de otro usuario.
+          # `Authorization` antes de reenviar. Es la ÚNICA protección contra
+          # spoofing de este header en esta Route —no hay además un
+          # `request-transformer` global ni por Route—: el propio plugin
+          # descarta cualquier `X-User-Id` entrante antes de escribir el suyo
+          # (kong/plugins/token-offloading/handler.lua), en un único
+          # `access()` atómico. Sin eso, un atacante podría mandar su propio
+          # `X-User-Id` y vincular un vehículo a la cuenta de otro usuario.
           - name: token-offloading
             config:
               claim: sub
@@ -256,6 +305,76 @@ services:
       # de Identity (puerto interno separado y/o secreto servicio a
       # servicio, documentado en su propio CLAUDE.md). Kong cubre sólo la
       # mitad perimetral del problema.
+
+  # ── vinculo-vial-alert ────────────────────────────────────────────────────
+  # US-05 — Escaneo de Patente y Alerta Anónima. El body es
+  # `{ "alert_type": "...", "pat_enc": "<cripto para Vehicle>" }`: el
+  # Gateway no lo inspecciona ni modifica, sólo reenvía. `pat_enc` sólo lo
+  # puede abrir Vehicle — Alert lo reenvía a ciegas a
+  # `/internal/resolve-owner` por red interna directa, nunca a través de
+  # una Route de Kong.
+  - name: alert-service
+    url: ${ALERT_SERVICE_URL}
+    connect_timeout: 5000
+    write_timeout: 15000
+    read_timeout: 15000
+    routes:
+      # Deliberadamente SIN `app-attestation`: decisión cerrada del
+      # contrato de US-05, por velocidad. Sin esa capa, `rate-limiting`
+      # por usuario deja de ser una cortesía operativa y pasa a ser la
+      # única defensa contra abuso automatizado sobre este endpoint —
+      # de ahí que corra con un límite mucho más estricto que el
+      # perimetral por IP (plugin global, más abajo).
+      - name: alerts-route
+        methods:
+          - POST
+        paths:
+          - /api/v1/alerts
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo par que vehicles-route: verifica la firma RS256 del
+          # Access Token contra la clave pública de Identity.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          # Traduce el `sub` ya validado a `X-User-Id` y quita el
+          # `Authorization` antes de reenviar. Corre en PRIORITY 1000
+          # (kong/plugins/token-offloading/handler.lua) — por encima de
+          # `rate-limiting` (910, nativo) — para que el header ya esté
+          # escrito cuando ese plugin lea `limit_by: header` más abajo.
+          # Es también la única protección contra spoofing de este header
+          # en esta Route, igual que en vehicles-route.
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          # Anti-abuso por usuario, no por IP: sin `app-attestation`,
+          # cualquiera con un JWT válido podría barrer el endpoint. El
+          # cupo es independiente por `X-User-Id` — dos usuarios distintos
+          # nunca comparten contador.
+          - name: rate-limiting
+            config:
+              minute: 5
+              hour: 10
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Igual que con Vehicle: no existe ninguna Route que matchee
+      # `/internal/*`. `/internal/resolve-owner` (Alert → Vehicle) es
+      # tráfico interno directo, nunca expuesto en Kong.
 
 # ── Consumers ────────────────────────────────────────────────────────────────
 # En este modelo el emisor de los tokens es Identity, no cada usuario final: el
@@ -283,24 +402,6 @@ plugins:
       # Se devuelve también al cliente: si la app reporta un error, el
       # identificador que ve el usuario es el mismo que está en los logs.
       echo_downstream: true
-
-  # Los headers de identidad los escribe exclusivamente el Gateway: los
-  # servicios internos confían en `X-User-Hash` / `X-User-Id` porque llegan
-  # por la red interna. Si un cliente los manda desde afuera y los dejamos
-  # pasar, suplanta a cualquier usuario. Se descartan en TODAS las rutas,
-  # incluidas las que no tienen `token-offloading` (como signup) — defensa en
-  # profundidad: `token-offloading` ya hace su propio `clear_header` antes de
-  # escribir el suyo, pero esta capa cubre también las rutas donde ese plugin
-  # ni siquiera corre. La misma limpieza preventiva se aplica a todo header
-  # de confianza interna que se introduzca en el futuro.
-  # Corre en prioridad 801, después de `app-attestation` (900) y antes de
-  # `token-offloading` (790), que es quien inyecta el valor legítimo.
-  - name: request-transformer
-    config:
-      remove:
-        headers:
-          - X-User-Hash
-          - X-User-Id
 
   # Rate limiting perimetral por IP de cliente. Primera línea de defensa contra
   # fuerza bruta y abuso automatizado sobre cualquier endpoint.
