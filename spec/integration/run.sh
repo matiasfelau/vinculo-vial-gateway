@@ -761,39 +761,37 @@ check_not_contains "el X-User-Id forjado no llega al upstream" \
 echo
 echo "Buzón de Alertas (US-07): rate limiting a 20/min, independiente del de /alerts"
 
-# Prueba, de paso, la precedencia de rutas: si un GET a /alerts/inbox
-# cayera por error en `alerts-route` (POST /alerts, 5/min), esta ráfaga
-# habría dejado pasar sólo 5 requests, no 20. Sub propio para no arrastrar
-# el cupo ya consumido en la sección anterior.
-#
-# Las 21 requests se disparan en paralelo (no en secuencia) a propósito: el
-# contador de `rate-limiting` con policy=local usa una ventana fija alineada
-# al reloj de pared (no relativa a la primera request), así que una ráfaga
-# secuencial de 21 llamadas —cada una con el overhead de un `docker exec`—
-# corre el riesgo real de cruzar el límite del minuto a mitad de camino y
-# reiniciar el contador, dejando pasar la request 21 por pura casualidad de
-# timing. En paralelo, las 21 llegan dentro de la misma ventana.
+# El contador de `rate-limiting` con policy=local usa una ventana fija
+# alineada al reloj de pared (no relativa a la primera request de esta
+# ráfaga): si arrancara sobre el filo de un minuto, la ventana podría rotar
+# a mitad de camino y reiniciar el contador, enmascarando el corte esperado
+# en la request 21 (probado empíricamente: tanto en secuencia como en
+# paralelo, sin esta espera, la ráfaga es flaky exactamente por esto). Se
+# espera a tener margen suficiente en el minuto de reloj actual antes de
+# arrancar, para que las ~21 requests —todas por `docker exec`, no
+# instantáneas— completen sin cruzarlo.
+rl_seconds_now="$(date +%S)"; rl_seconds_now=$((10#${rl_seconds_now}))
+if (( rl_seconds_now > 30 )); then
+  rl_sleep_for=$((60 - rl_seconds_now))
+  echo "  (esperando ${rl_sleep_for}s al próximo minuto de reloj, para no cruzar la ventana del rate-limiting a mitad de la ráfaga)"
+  sleep "${rl_sleep_for}"
+fi
+
 inbox_rl_user="9f1c2d3e-4b5a-4c6d-8e9f-0a1b2c3d4e5f"
 inbox_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${inbox_rl_user}\",\"exp\":$((now + 300))}")"
 
-rl_tmp="$(mktemp -d)"
-for i in $(seq 1 21); do
-  ( alerts_inbox_status "${inbox_rl_token}" > "${rl_tmp}/${i}" ) &
+# Prueba, de paso, la precedencia de rutas: si un GET a /alerts/inbox
+# cayera por error en `alerts-route` (POST /alerts, 5/min), esta secuencia
+# de 20 requests exitosos habría fallado mucho antes del vigésimo.
+for _ in $(seq 1 19); do
+  alerts_inbox_status "${inbox_rl_token}" >/dev/null
 done
-wait
 
-rl_ok=0
-rl_limited=0
-for i in $(seq 1 21); do
-  case "$(cat "${rl_tmp}/${i}")" in
-    200) rl_ok=$((rl_ok + 1)) ;;
-    429) rl_limited=$((rl_limited + 1)) ;;
-  esac
-done
-rm -rf "${rl_tmp}"
+check "el request 20 en el minuto todavía pasa" \
+  200 "$(alerts_inbox_status "${inbox_rl_token}")"
 
-check "de 21 requests en el mismo minuto, exactamente 20 pasan" 20 "${rl_ok}"
-check "y exactamente 1 se rechaza con 429" 1 "${rl_limited}"
+check "el request 21 en el minuto se rechaza con 429" \
+  429 "$(alerts_inbox_status "${inbox_rl_token}")"
 
 inbox_other_user="1a2b3c4d-5e6f-4789-9a0b-1c2d3e4f5a6b"
 inbox_other_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${inbox_other_user}\",\"exp\":$((now + 300))}")"
