@@ -313,6 +313,9 @@ services:
   # puede abrir Vehicle — Alert lo reenvía a ciegas a
   # `/internal/resolve-owner` por red interna directa, nunca a través de
   # una Route de Kong.
+  #
+  # US-07 — Buzón de Alertas (lectura), sobre el mismo Service: ver
+  # `alerts-inbox-route`, más abajo.
   - name: alert-service
     url: ${ALERT_SERVICE_URL}
     connect_timeout: 5000
@@ -364,6 +367,59 @@ services:
             config:
               minute: 5
               hour: 10
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # US-07 — Buzón de Alertas (lectura). Comparte prefijo con
+      # `alerts-route` (`/api/v1/alerts`), pero Kong resuelve por método
+      # además de por path: `alerts-route` declara `methods: [POST]` de
+      # forma explícita (más arriba), así que un `GET` nunca puede
+      # matchearla, sin importar la especificidad del path. Verificado
+      # también con un test de integración dedicado.
+      - name: alerts-inbox-route
+        methods:
+          - GET
+        paths:
+          - /api/v1/alerts/inbox
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo par que alerts-route: verifica la firma RS256 del Access
+          # Token e inyecta `X-User-Id` a partir del `sub` ya validado. La
+          # paginación (`limit`/`cursor`) viaja en la query string sin que
+          # el Gateway la toque: el recorte del `limit` al tope y la
+          # validación del `cursor` son responsabilidad de Alert, no de
+          # este perímetro.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          # 20/min: más permisivo que los 5/min de alerts-route porque este
+          # endpoint es de lectura, idempotente y sin efectos — y sólo
+          # devuelve datos que ya pertenecen al usuario autenticado, a
+          # diferencia de alerts-route, que sí necesita un límite estricto
+          # por no tener `app-attestation` delante. Depende de la misma
+          # PRIORITY=1000 de `token-offloading` que alerts-route: si ese
+          # plugin corriera después de `rate-limiting`, el límite por
+          # usuario degradaría en silencio a otro criterio.
+          - name: rate-limiting
+            config:
+              minute: 20
               limit_by: header
               header_name: X-User-Id
               policy: local
