@@ -9,19 +9,23 @@ Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
 (US-03, Gestión de Sesión) hacia `vinculo-vial-identity`, `POST
 /api/v1/vehicles` (US-04, Vinculación de Vehículo) hacia
 `vinculo-vial-vehicle`, y `POST /api/v1/alerts` (US-05, Escaneo de Patente y
-Alerta Anónima) hacia `vinculo-vial-alert`. Valida **App Attestation**
-(`X-App-Attestation`, contra Google Play Integrity) en signup, signin y
-refresh antes de permitir tráfico hacia la red interna — **logout es la
-única excepción deliberada** (ver más abajo). `/vehicles` y `/alerts` usan un
-perímetro distinto: **Token Offloading** real — Kong verifica el Access
-Token (JWT RS256) y traduce el claim `sub` al header `X-User-Id`, para que
-el upstream nunca vea ni necesite validar el JWT. `/alerts` no tiene
-`app-attestation` (decisión cerrada del contrato de US-05, por velocidad) y
-se apoya en cambio en **rate limiting por usuario** (5/min, 10/hora sobre
-`X-User-Id`) como control de seguridad, no como cortesía operativa. El body
-de signup/signin/vehicles/alerts viaja cifrado extremo a extremo (HPKE) y el
+Alerta Anónima) + `GET /api/v1/alerts/inbox` (US-07, Buzón de Alertas) hacia
+`vinculo-vial-alert`. Valida **App Attestation** (`X-App-Attestation`, contra
+Google Play Integrity) en signup, signin y refresh antes de permitir tráfico
+hacia la red interna — **logout es la única excepción deliberada** (ver más
+abajo). `/vehicles`, `/alerts` y `/alerts/inbox` usan un perímetro distinto:
+**Token Offloading** real — Kong verifica el Access Token (JWT RS256) y
+traduce el claim `sub` al header `X-User-Id`, para que el upstream nunca vea
+ni necesite validar el JWT. Ninguna de las tres tiene `app-attestation`
+(decisión cerrada del contrato desde US-05, por velocidad) y se apoyan en
+cambio en **rate limiting por usuario** sobre `X-User-Id` — 5/min y 10/hora en
+`/alerts`, como control de seguridad y no como cortesía operativa; 20/min en
+`/alerts/inbox`, más permisivo por tratarse de lectura idempotente. El body de
+signup/signin/vehicles/alerts viaja cifrado extremo a extremo (HPKE) y el
 Gateway nunca lo inspecciona ni lo modifica; el de refresh/logout es un
-Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
+Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS;
+`/alerts/inbox` no tiene body, sólo query params de paginación que el Gateway
+reenvía sin tocar.
 
 ## Estado
 
@@ -31,16 +35,18 @@ Refresh Token opaco sin cifrado propio, cuya confidencialidad la aporta HTTPS.
 | Ruteo declarativo a `identity-service` (`/auth/signup`, `/auth/signin`, `/auth/refresh`, `/auth/logout`) | ✅ |
 | Ruteo declarativo a `vehicle-service` (`/vehicles`, US-04) | ✅ |
 | Ruteo declarativo a `alert-service` (`/alerts`, US-05) | ✅ |
+| Ruteo declarativo a `alert-service` (`/alerts/inbox`, US-07) | ✅ |
 | Rate limiting global | ✅ |
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
+| Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| `/alerts` exento de atestación (decisión cerrada del contrato US-05, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` y `/alerts`) | ✅ |
+| `/alerts` y `/alerts/inbox` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts` y `/alerts/inbox`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle y Alert) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 91 tests unitarios + 57 de integración | ✅ |
+| CI: 91 tests unitarios + 67 de integración | ✅ |
 
 ## Estructura
 
@@ -431,6 +437,59 @@ explícitamente en la suite de integración. El mismo alcance limitado que en
 Vehicle aplica acá: Kong bloquea el acceso desde afuera de la plataforma,
 pero no aísla el endpoint dentro de la red Docker.
 
+## Buzón de Alertas: `/alerts/inbox` (US-07)
+
+Endpoint de **lectura**, sobre el mismo Service `alert-service` de US-05. Mismo
+perímetro base que `/alerts`: `jwt` verifica el Access Token y
+`token-offloading` traduce el `sub` a `X-User-Id`. Tampoco lleva
+`app-attestation` — mismo motivo que `/alerts` — pero el `rate-limiting` que
+lo reemplaza es deliberadamente más permisivo:
+
+| Ruta | Perímetro | Límite por usuario |
+|---|---|---|
+| `GET /alerts/inbox` | `jwt` + `token-offloading` + `rate-limiting` | 20/min sobre `X-User-Id` |
+
+### Por qué 20/min y no 5/min como `/alerts`
+
+`/alerts` es una operación de escritura sin `app-attestation` por delante, así
+que su `rate-limiting` es la única defensa contra abuso automatizado — de ahí
+el límite estricto. `/alerts/inbox` es de lectura, idempotente y sin efectos:
+sólo devuelve datos que ya pertenecen al usuario autenticado, no es un oráculo
+de descubrimiento sobre datos ajenos. Una app puede necesitar refrescarlo con
+frecuencia legítima, así que el límite es más holgado — sigue dependiendo de
+la misma `PRIORITY = 1000` de `token-offloading` que `/alerts` (ver
+[Headers de identidad](#headers-de-identidad)): si ese plugin corriera después
+de `rate-limiting`, el límite por usuario degradaría en silencio a otro
+criterio, igual que en `/alerts`.
+
+### Paginación por cursor
+
+Acepta `limit` (opcional, default 20, tope 100) y `cursor` (opaco, ausente en
+la primera página) como query params, que el Gateway reenvía sin tocar —
+`strip_path: false`, igual que el resto de las Routes del repo. El recorte del
+`limit` al tope y la validación del `cursor` son responsabilidad de Alert, no
+del Gateway: **Never Trust the Client se aplica en el servicio dueño del
+dato**, no en el borde, y está prohibido sumar acá lógica de negocio de
+paginación.
+
+### Precedencia frente a `POST /alerts`
+
+Ambas Routes comparten el prefijo `/api/v1/alerts`, pero Kong resuelve por
+método además de por path: `alerts-route` declara `methods: [POST]` de forma
+explícita, así que un `GET` nunca puede matchearla, sin importar la
+especificidad del path. Verificado en la suite de integración con una
+secuencia de 20 requests exitosos a `/alerts/inbox` seguidos de un 21° que
+recibe `429` — si el `GET` hubiera caído por error en `alerts-route`, esa
+secuencia habría fallado mucho antes del vigésimo request, contra el límite de
+5/min de esa Route.
+
+### Zero-PII
+
+El DTO de salida (`id`, `alert_type`, `created_at`) es responsabilidad
+exclusiva de Alert; el Gateway no inspecciona el body de la respuesta, sólo la
+perimetra. La regla de anonimato del emisor —nunca `issuer_id`, `owner_id` ni
+la patente hacia el cliente— vive en el contrato compartido, no en este repo.
+
 ## Tamaño del payload
 
 El sobre HPKE de signup incluye una selfie comprimida en base64 (~200KB); el de
@@ -516,8 +575,8 @@ cobertura.
 El orden de plugins relevante en cada caso:
 
 ```
-Rutas con token-offloading (/users/me, /vehicles y, desde US-05, /vehicles/check y /alerts):
-  jwt (1450) → token-offloading (1000) → rate-limiting (910, sólo en las de US-05)
+Rutas con token-offloading (/users/me, /vehicles y, desde US-05/US-07, /alerts y /alerts/inbox):
+  jwt (1450) → token-offloading (1000) → rate-limiting (910, sólo en /alerts y /alerts/inbox)
 
 Rutas sin token-offloading (signup, signin, refresh, logout):
   rate-limiting (910) → app-attestation (900, salvo logout) → request-transformer (801, por Route)

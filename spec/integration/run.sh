@@ -170,6 +170,25 @@ alerts_status() {
   fi
 }
 
+# Manda un GET a /api/v1/alerts/inbox con el Bearer token dado (vacío = sin
+# header Authorization), query params opcionales, y devuelve el status HTTP.
+# US-07: mismo par jwt + token-offloading que alerts_status, más
+# rate-limiting a 20/min por X-User-Id (más permisivo que el de alerts_status
+# porque es lectura idempotente); el rate-limiting exhaustivo se verifica en
+# su propia sección, no acá.
+alerts_inbox_status() {
+  local token="$1" query="${2:-}"
+
+  if [[ -z "${token}" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X GET "http://127.0.0.1:8000/api/v1/alerts/inbox${query}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X GET "http://127.0.0.1:8000/api/v1/alerts/inbox${query}" \
+      -H "Authorization: Bearer ${token}"
+  fi
+}
+
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
 # el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
 # service account de Google — no una reimplementación paralela del firmado.
@@ -700,6 +719,87 @@ check "/internal/resolve-owner no tiene Route: 404" \
     -X POST http://127.0.0.1:8000/internal/resolve-owner \
     -H 'Content-Type: application/json' \
     -d '{"pat_enc":"cripto-para-vehicle"}')"
+
+echo
+echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
+
+# Mismo usuario que en las secciones anteriores: el rate-limiting de esta
+# Route es una instancia de plugin propia (Route distinta), así que reusar
+# el sub no cruza cupos con /alerts ni con /vehicles. La verificación
+# exhaustiva del límite de 20/min es una sección aparte, más abajo.
+check "sin Authorization, 401 sin necesidad de un JWT" \
+  401 "$(alerts_inbox_status "")"
+
+inbox_expired_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${USER_SUB}\",\"exp\":$((now - 300))}")"
+check "un JWT expirado se rechaza con 401" \
+  401 "$(alerts_inbox_status "${inbox_expired_token}")"
+
+check "un JWT válido, firmado y sin vencer, pasa" \
+  200 "$(alerts_inbox_status "${valid_token}")"
+
+inbox_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X GET http://127.0.0.1:8000/api/v1/alerts/inbox \
+  -H "Authorization: Bearer ${valid_token}")"
+
+check_contains "Alert recibe X-User-Id con el sub del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${inbox_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el Authorization no se propaga al upstream (token offloading)" \
+  "authorization" "$(printf '%s' "${inbox_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+
+inbox_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+  -X GET http://127.0.0.1:8000/api/v1/alerts/inbox \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'X-User-Id: usuario-suplantado')"
+
+check_contains "un X-User-Id forjado por el cliente se reemplaza por el del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${inbox_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el X-User-Id forjado no llega al upstream" \
+  "usuario-suplantado" "$(printf '%s' "${inbox_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Buzón de Alertas (US-07): rate limiting a 20/min, independiente del de /alerts"
+
+# Prueba, de paso, la precedencia de rutas: si un GET a /alerts/inbox
+# cayera por error en `alerts-route` (POST /alerts, 5/min), esta ráfaga
+# habría dejado pasar sólo 5 requests, no 20. Sub propio para no arrastrar
+# el cupo ya consumido en la sección anterior.
+#
+# Las 21 requests se disparan en paralelo (no en secuencia) a propósito: el
+# contador de `rate-limiting` con policy=local usa una ventana fija alineada
+# al reloj de pared (no relativa a la primera request), así que una ráfaga
+# secuencial de 21 llamadas —cada una con el overhead de un `docker exec`—
+# corre el riesgo real de cruzar el límite del minuto a mitad de camino y
+# reiniciar el contador, dejando pasar la request 21 por pura casualidad de
+# timing. En paralelo, las 21 llegan dentro de la misma ventana.
+inbox_rl_user="9f1c2d3e-4b5a-4c6d-8e9f-0a1b2c3d4e5f"
+inbox_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${inbox_rl_user}\",\"exp\":$((now + 300))}")"
+
+rl_tmp="$(mktemp -d)"
+for i in $(seq 1 21); do
+  ( alerts_inbox_status "${inbox_rl_token}" > "${rl_tmp}/${i}" ) &
+done
+wait
+
+rl_ok=0
+rl_limited=0
+for i in $(seq 1 21); do
+  case "$(cat "${rl_tmp}/${i}")" in
+    200) rl_ok=$((rl_ok + 1)) ;;
+    429) rl_limited=$((rl_limited + 1)) ;;
+  esac
+done
+rm -rf "${rl_tmp}"
+
+check "de 21 requests en el mismo minuto, exactamente 20 pasan" 20 "${rl_ok}"
+check "y exactamente 1 se rechaza con 429" 1 "${rl_limited}"
+
+inbox_other_user="1a2b3c4d-5e6f-4789-9a0b-1c2d3e4f5a6b"
+inbox_other_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${inbox_other_user}\",\"exp\":$((now + 300))}")"
+
+check "un usuario distinto no comparte cupo con el que ya alcanzó el límite" \
+  200 "$(alerts_inbox_status "${inbox_other_token}")"
 
 echo
 if (( failures > 0 )); then
