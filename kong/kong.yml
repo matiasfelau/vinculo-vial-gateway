@@ -432,6 +432,69 @@ services:
       # `/internal/*`. `/internal/resolve-owner` (Alert → Vehicle) es
       # tráfico interno directo, nunca expuesto en Kong.
 
+  # ── vinculo-vial-notification ───────────────────────────────────────────────
+  # US-06 — Registro y baja de tokens FCM. El body de POST es
+  # `{ "fcm_token": "<...>" }`, sin cifrado propio: el token FCM no es un dato
+  # sensible en el sentido HPKE del resto de la plataforma, así que el Gateway
+  # lo reenvía intacto sin más tratamiento que el perímetro de sesión.
+  - name: notification-service
+    url: ${NOTIFICATION_SERVICE_URL}
+    connect_timeout: 5000
+    write_timeout: 15000
+    read_timeout: 15000
+    routes:
+      # Alta de token. Sin `app-attestation` — mismo criterio que /vehicles y
+      # /alerts: la sesión (jwt + token-offloading) ya exige un Access Token
+      # válido, y acá el rate-limiting por usuario cierra el resto del
+      # perímetro (ver más abajo).
+      - name: notification-tokens-post-route
+        methods:
+          - POST
+        paths:
+          - /api/v1/notifications/tokens
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo par que vehicles-route y alerts-route: verifica la firma
+          # RS256 del Access Token e inyecta `X-User-Id` a partir del `sub`
+          # ya validado.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          # 10/día: un token FCM rota con poca frecuencia (reinstalación,
+          # restauración de backup, limpieza de datos de la app). Diez altas
+          # diarias por usuario es holgado para el uso legítimo y acota el
+          # abuso de escritura sobre este endpoint, que no tiene
+          # `app-attestation` por delante. Depende de la misma PRIORITY=1000
+          # de `token-offloading` que /alerts y /alerts/inbox: si ese plugin
+          # corriera después de `rate-limiting`, el límite por usuario
+          # degradaría en silencio a otro criterio (ver
+          # `kong/plugins/token-offloading/handler.lua`).
+          - name: rate-limiting
+            config:
+              day: 10
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # No existe ninguna Route que matchee `/internal/*`, mismo criterio que
+      # en Vehicle y Alert.
+
 # ── Consumers ────────────────────────────────────────────────────────────────
 # En este modelo el emisor de los tokens es Identity, no cada usuario final: el
 # Gateway sólo necesita la clave pública para verificar la firma, y la

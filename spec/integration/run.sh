@@ -189,6 +189,27 @@ alerts_inbox_status() {
   fi
 }
 
+# Manda un POST a /api/v1/notifications/tokens con el Bearer token dado
+# (vacío = sin header Authorization) y devuelve el status HTTP. US-06: mismo
+# par jwt + token-offloading que alerts_status, más rate-limiting a 10/día
+# por X-User-Id (ese tercer plugin se verifica en su propia sección, no acá).
+notifications_post_status() {
+  local token="$1" body="${2:-\{\}}"
+
+  if [[ -z "${token}" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}"
+  fi
+}
+
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
 # el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
 # service account de Google — no una reimplementación paralela del firmado.
@@ -294,6 +315,7 @@ docker run -d --name "${GATEWAY}" --network "${NETWORK}" \
   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
@@ -798,6 +820,89 @@ inbox_other_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${inbox_othe
 
 check "un usuario distinto no comparte cupo con el que ya alcanzó el límite" \
   200 "$(alerts_inbox_status "${inbox_other_token}")"
+
+echo
+echo "Registro de Token FCM (US-06): JWT y Token Offloading en POST /notifications/tokens"
+
+# Mismo esquema que /alerts y /alerts/inbox: el rate-limiting de esta Route
+# es una instancia de plugin propia, así que reusar el sub no cruza cupos.
+# La verificación exhaustiva del límite de 10/día es una sección aparte, más
+# abajo, con un usuario dedicado para no consumir cupo de estos chequeos.
+notif_body='{"fcm_token":"token-fcm-de-prueba"}'
+
+check "sin Authorization, 401 sin necesidad de un JWT" \
+  401 "$(notifications_post_status "" "${notif_body}")"
+
+notif_expired_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${USER_SUB}\",\"exp\":$((now - 300))}")"
+check "un JWT expirado se rechaza con 401" \
+  401 "$(notifications_post_status "${notif_expired_token}" "${notif_body}")"
+
+check "un JWT válido, firmado y sin vencer, pasa" \
+  200 "$(notifications_post_status "${valid_token}" "${notif_body}")"
+
+notif_upstream_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${notif_body}")"
+
+check_contains "Notification recibe X-User-Id con el sub del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${notif_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el Authorization no se propaga al upstream (token offloading)" \
+  "authorization" "$(printf '%s' "${notif_upstream_view}" | tr '[:upper:]' '[:lower:]')"
+check_contains "el body (fcm_token) llega intacto al upstream" \
+  "token-fcm-de-prueba" "${notif_upstream_view}"
+
+notif_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+  -H "Authorization: Bearer ${valid_token}" \
+  -H 'X-User-Id: usuario-suplantado' \
+  -H 'Content-Type: application/json' \
+  --data-binary "${notif_body}")"
+
+check_contains "un X-User-Id forjado por el cliente se reemplaza por el del JWT" \
+  "\"x-user-id\": \"${USER_SUB}\"" \
+  "$(printf '%s' "${notif_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el X-User-Id forjado no llega al upstream" \
+  "usuario-suplantado" "$(printf '%s' "${notif_spoofed_view}" | tr '[:upper:]' '[:lower:]')"
+
+echo
+echo "Registro de Token FCM (US-06): /internal/* no existe en Kong"
+
+check "/internal/* no tiene Route: 404" \
+  404 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/internal/notifications \
+    -H 'Content-Type: application/json' \
+    -d '{}')"
+
+echo
+echo "Registro de Token FCM (US-06): rate limiting a 10/día"
+
+# Ventana `day`, no `minute`: a diferencia del rate-limiting de
+# /alerts/inbox (ver más arriba), el riesgo de que esta ráfaga cruce el
+# límite de la ventana a mitad de camino es despreciable (se necesitarían
+# ~86400s para que la ventana rote, contra los pocos segundos que tardan 11
+# requests secuenciales por `docker exec`), así que no hace falta un guard
+# de reloj de pared acá.
+notif_rl_user="4c5d6e7f-8a9b-4c1d-9e2f-3a4b5c6d7e8f"
+notif_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${notif_rl_user}\",\"exp\":$((now + 300))}")"
+
+for _ in $(seq 1 9); do
+  notifications_post_status "${notif_rl_token}" "${notif_body}" >/dev/null
+done
+
+check "el request 10 del día todavía pasa" \
+  200 "$(notifications_post_status "${notif_rl_token}" "${notif_body}")"
+
+check "el request 11 del día se rechaza con 429" \
+  429 "$(notifications_post_status "${notif_rl_token}" "${notif_body}")"
+
+notif_other_user="2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
+notif_other_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${notif_other_user}\",\"exp\":$((now + 300))}")"
+
+check "un usuario distinto no comparte cupo con el que ya alcanzó el límite" \
+  200 "$(notifications_post_status "${notif_other_token}" "${notif_body}")"
 
 echo
 if (( failures > 0 )); then
