@@ -133,7 +133,7 @@ body_hash() {
 # signup/signin/refresh, esta Route no exige `app-attestation` — la exige
 # `jwt` + `token-offloading`.
 vehicles_status() {
-  local token="$1" body="${2:-\{\}}"
+  local token="$1" body="${2:-{}}"
 
   if [[ -z "${token}" ]]; then
     docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
@@ -154,7 +154,7 @@ vehicles_status() {
 # token-offloading que vehicles_status, más rate-limiting por X-User-Id (ese
 # tercer plugin se verifica en su propia suite, no acá).
 alerts_status() {
-  local token="$1" body="${2:-\{\}}"
+  local token="$1" body="${2:-{}}"
 
   if [[ -z "${token}" ]]; then
     docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
@@ -194,7 +194,7 @@ alerts_inbox_status() {
 # par jwt + token-offloading que alerts_status, más rate-limiting a 10/día
 # por X-User-Id (ese tercer plugin se verifica en su propia sección, no acá).
 notifications_post_status() {
-  local token="$1" body="${2:-\{\}}"
+  local token="$1" body="${2:-{}}"
 
   if [[ -z "${token}" ]]; then
     docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
@@ -215,7 +215,7 @@ notifications_post_status() {
 # par jwt + token-offloading que notifications_post_status, pero SIN
 # rate-limiting — esa ausencia se verifica en su propia sección, no acá.
 notifications_delete_status() {
-  local token="$1" body="${2:-\{\}}"
+  local token="$1" body="${2:-{}}"
 
   if [[ -z "${token}" ]]; then
     docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
