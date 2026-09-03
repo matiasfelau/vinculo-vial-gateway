@@ -52,6 +52,7 @@ jobs:
             -e IDENTITY_SERVICE_URL=http://identity.invalid:8080 \
             -e VEHICLE_SERVICE_URL=http://vehicle.invalid:8080 \
             -e ALERT_SERVICE_URL=http://alert.invalid:8080 \
+            -e NOTIFICATION_SERVICE_URL=http://notification.invalid:8080 \
             vinculo-vial-gateway:ci
 
           for i in $(seq 1 30); do
