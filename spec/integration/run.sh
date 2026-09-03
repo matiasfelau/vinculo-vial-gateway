@@ -269,8 +269,11 @@ docker run -d --name "${STUB}" --network "${NETWORK}" \
   -c 'mkdir -p /tmp/stub/logs && exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/stub -g "daemon off;"' \
   >/dev/null
 
+# :31 devolvía 500 de forma intermitente en requests POST con body, una vez
+# que la suite creció lo suficiente para exponerlo (no reproducible con pocas
+# requests) — corregido en versiones más recientes de la imagen.
 docker run -d --name "${UPSTREAM}" --network "${NETWORK}" \
-  -e HTTP_PORT=8080 mendhak/http-https-echo:31 >/dev/null
+  -e HTTP_PORT=8080 mendhak/http-https-echo:41 >/dev/null
 
 # Service account de juguete: clave RSA nueva en cada corrida, con el
 # `token_uri` apuntando al stub. Nada de esto se versiona.
