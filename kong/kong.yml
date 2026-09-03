@@ -492,6 +492,35 @@ services:
               error_code: 429
               error_message: "API rate limit exceeded"
 
+      # Baja de token. Deliberadamente SIN `rate-limiting`: un límite
+      # alcanzado acá deja al dispositivo recibiendo notificaciones que ya no
+      # le corresponden — fuga de privacidad, no una molestia. Mismo criterio
+      # que eximir `/auth/logout` de `app-attestation`. Route separada de la
+      # de alta (no un único `POST`+`DELETE` compartido) precisamente para
+      # que el rate-limiting de arriba no se herede también acá.
+      - name: notification-tokens-delete-route
+        methods:
+          - DELETE
+        paths:
+          - /api/v1/notifications/tokens
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+
       # No existe ninguna Route que matchee `/internal/*`, mismo criterio que
       # en Vehicle y Alert.
 
