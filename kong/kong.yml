@@ -257,6 +257,10 @@ services:
   # interno directo, nunca una Route de Kong — ver más abajo.
   - name: vehicle-service
     url: ${VEHICLE_SERVICE_URL}
+    # La vinculación de vehículo es una operación no idempotente (crea el
+    # registro de vinculación): mismo criterio que `identity-service`, sólo se
+    # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
+    retries: 1
     connect_timeout: 5000
     write_timeout: 15000
     read_timeout: 15000
@@ -318,6 +322,10 @@ services:
   # `alerts-inbox-route`, más abajo.
   - name: alert-service
     url: ${ALERT_SERVICE_URL}
+    # El alta de alerta es una operación no idempotente: mismo criterio que
+    # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
+    # ante una respuesta del upstream.
+    retries: 1
     connect_timeout: 5000
     write_timeout: 15000
     read_timeout: 15000
@@ -439,6 +447,10 @@ services:
   # lo reenvía intacto sin más tratamiento que el perímetro de sesión.
   - name: notification-service
     url: ${NOTIFICATION_SERVICE_URL}
+    # El alta de token FCM es una operación no idempotente: mismo criterio que
+    # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
+    # ante una respuesta del upstream.
+    retries: 1
     connect_timeout: 5000
     write_timeout: 15000
     read_timeout: 15000
