@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 91 tests unitarios + 88 de integración | ✅ |
+| CI: 94 tests unitarios + 93 de integración | ✅ |
 
 ## Estructura
 
@@ -648,7 +648,7 @@ Los rechazos generados por los plugins propios comparten una única forma
 |---|---|---|---|
 | Atestación ausente, mal formada, con firma inválida, expirada o con veredicto rechazado | `403` | `forbidden` | `invalid_attestation` |
 | JWT de sesión del que no se puede derivar identidad | `401` | `unauthorized` | `invalid_token` |
-| Google/Play Integrity inalcanzable o sin respuesta dentro de `http_timeout_ms` | `503` | `service_unavailable` | `dependency_unavailable` |
+| Google/Play Integrity inalcanzable, o sin respuesta dentro del presupuesto del par de llamadas | `503` | `service_unavailable` | `dependency_unavailable` |
 | Google/Play Integrity respondió `5xx`, o un `200` con un cuerpo fuera de contrato | `502` | `bad_gateway` | `dependency_error` |
 
 El motivo real (`invalid_signature`, `expired_token`, `device_verdict_rejected`,
@@ -676,6 +676,39 @@ equivalente para interceptar la respuesta nativa de Kong (ver nota siguiente).
 > punto donde reclasificar ese código antes de responder. Es una excepción
 > deliberada y documentada al criterio general de la plataforma (503 =
 > dependencia propia no disponible), no una inconsistencia pendiente.
+
+## Presupuesto de latencia
+
+Cada request que atraviesa el Gateway tiene un techo de 12000ms en el peor
+caso: `2 × connect_timeout + read_timeout` (el `2 ×` es por el reintento de
+`retries: 1` ante un fallo de conexión; `write_timeout` no participa porque un
+upstream sano en la misma red no se estanca escribiendo, sólo conectando o
+leyendo — verificado en la suite de integración, ver "Resiliencia (K2)").
+
+| Service | `connect_timeout` | `read_timeout` | `write_timeout` | Peor caso |
+|---|---|---|---|---|
+| `identity-service` | 1000 | 6000 | 15000 | 8000 |
+| `vehicle-service` | 1000 | 9000 | 9000 | 11000 |
+| `alert-service` | 1000 | 9000 | 9000 | 11000 |
+| `notification-service` | 1000 | 9000 | 9000 | 11000 |
+
+`identity-service` queda más ajustado porque sus Routes (`/auth/signup`,
+`/auth/signin`, `/auth/refresh`) además cargan `app-attestation`, que reparte
+el resto del presupuesto (hasta 4000ms) contra Google: `8000 + 4000 = 12000`.
+Las otras tres Routes no tienen esa dependencia y usan el presupuesto
+completo. El `write_timeout` de `identity-service` queda sin acotar porque el
+body de signup lleva una selfie y necesita margen para subir, no para que
+Identity responda — no entra en la cuenta del peor caso por el motivo de
+arriba.
+
+Dentro de `app-attestation`, el canje de OAuth y el POST a
+`decodeIntegrityToken` comparten un presupuesto agregado de 4000ms
+(`ATTESTATION_DEPENDENCY_TIMEOUT_MS`), no 4000ms cada uno: lo que consume el
+primero se descuenta del segundo. Con el access token en caché (el caso
+común, dura una hora) el primero ni ocurre, así que el segundo dispone del
+agregado completo. Cada llamada además respeta un techo individual de 3000ms
+(`ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS`), para que ninguna de las dos pueda
+sola agotar el presupuesto del par.
 
 ## Convenciones
 

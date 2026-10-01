@@ -86,8 +86,25 @@ return {
               default = "https://playintegrity.googleapis.com",
             },
           },
+          -- Presupuesto total para el PAR de llamadas (canje de OAuth +
+          -- decodeIntegrityToken), no por llamada: si la primera consume
+          -- parte del presupuesto, a la segunda le queda el resto, nunca una
+          -- ventana nueva de este mismo tamaño. Con el access token en caché
+          -- (caso común) la primera llamada ni ocurre, así que la segunda
+          -- dispone del presupuesto completo.
           {
-            http_timeout_ms = {
+            dependency_timeout_ms = {
+              type = "integer",
+              required = true,
+              default = 4000,
+              between = { 100, 30000 },
+            },
+          },
+          -- Techo por llamada individual, aparte del agregado de arriba:
+          -- ninguna de las dos llamadas puede sola consumir todo el
+          -- presupuesto del par.
+          {
+            dependency_call_timeout_ms = {
               type = "integer",
               required = true,
               default = 3000,

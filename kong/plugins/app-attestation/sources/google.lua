@@ -49,16 +49,36 @@ function M.parse_response(status, body)
 end
 
 --- Canjea el token de integridad por su veredicto.
+--
+-- El canje de OAuth y el POST a decodeIntegrityToken comparten un único
+-- presupuesto agregado (`conf.dependency_timeout_ms`): lo que consume el
+-- primero se descuenta del segundo, nunca se duplica. Cada llamada además
+-- respeta su propio techo (`conf.dependency_call_timeout_ms`), así que
+-- ninguna de las dos puede sola agotar el presupuesto del par.
+--
 -- @param token string token opaco emitido por Play Integrity en el dispositivo
 -- @param conf table configuración del plugin
 -- @return table veredicto canónico
 -- @return nil, string motivo interno del rechazo, string clasificación del
 --         fallo (ver `parse_response`; "unavailable" si Google o el canje de
---         OAuth previo fueron inalcanzables o no respondieron a tiempo)
+--         OAuth previo fueron inalcanzables, no respondieron a tiempo, o no
+--         quedó presupuesto para intentar la segunda llamada)
 function M.fetch(token, conf)
-  local access_token, oauth_err, oauth_kind = google_oauth.get_access_token(conf)
+  local started_at = ngx.now()
+  local oauth_timeout = math.min(conf.dependency_timeout_ms, conf.dependency_call_timeout_ms)
+
+  local access_token, oauth_err, oauth_kind = google_oauth.get_access_token(conf, oauth_timeout)
   if not access_token then
     return nil, oauth_err, oauth_kind
+  end
+
+  local elapsed_ms = (ngx.now() - started_at) * 1000
+  local remaining_ms = conf.dependency_timeout_ms - elapsed_ms
+  if remaining_ms <= 0 then
+    -- El canje de OAuth consumió todo el presupuesto del par (típicamente
+    -- porque no había access token en caché y Google tardó): no tiene
+    -- sentido intentar una segunda llamada sin tiempo para ella.
+    return nil, "playintegrity_deadline_exceeded", "unavailable"
   end
 
   local url = conf.playintegrity_url
@@ -67,7 +87,7 @@ function M.fetch(token, conf)
     .. ":decodeIntegrityToken"
 
   local client = http.new()
-  client:set_timeout(conf.http_timeout_ms)
+  client:set_timeout(math.min(remaining_ms, conf.dependency_call_timeout_ms))
 
   local res, request_err = client:request_uri(url, {
     method = "POST",

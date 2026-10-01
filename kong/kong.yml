@@ -17,9 +17,18 @@ services:
     # El registro es una operación no idempotente (crea un usuario): sólo se
     # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
     retries: 1
-    connect_timeout: 5000
+    # Presupuesto de latencia del Gateway por request: 12000ms en el peor
+    # caso (2 × connect_timeout, por el reintento ante fallo de conexión, más
+    # read_timeout; write_timeout no cuenta porque un upstream sano en la
+    # misma red no se estanca escribiendo, sólo leyendo o conectando). Las
+    # Routes de este Service además cargan `app-attestation` (hasta 4000ms
+    # agregados contra Google): connect_timeout + read_timeout se acotan más
+    # que en el resto para dejarle ese margen, sin tocar write_timeout —
+    # el body de signup lleva una selfie y necesita más tiempo para subir,
+    # no para que Identity responda.
+    connect_timeout: 1000
     write_timeout: 15000
-    read_timeout: 15000
+    read_timeout: 6000
     routes:
       # US-01 — Registro. El body es un sobre HPKE: el Gateway no lo inspecciona
       # ni lo modifica, sólo lo reenvía.
@@ -87,6 +96,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-02 — Login. Mismo esquema de body que signup: sobre HPKE, el
       # Gateway no lo inspecciona ni lo modifica, sólo lo reenvía. Identity
@@ -140,6 +154,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-03 — Gestión de Sesión (RTR). El body es `{ "refresh_token": "<...>" }`,
       # un string opaco SIN el sobre HPKE de signup/signin: la confidencialidad
@@ -182,6 +201,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # Deliberadamente SIN `app-attestation`: cerrar sesión es una acción de
       # seguridad del usuario, no una operación que emita credenciales nuevas.
@@ -261,9 +285,12 @@ services:
     # registro de vinculación): mismo criterio que `identity-service`, sólo se
     # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
     retries: 1
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Presupuesto de 12000ms en el peor caso (2 × connect_timeout +
+    # read_timeout), igual que `identity-service`, pero sin repartir margen
+    # con ninguna dependencia externa: esta Route no carga `app-attestation`.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       - name: vehicles-route
         methods:
@@ -326,9 +353,11 @@ services:
     # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
     # ante una respuesta del upstream.
     retries: 1
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Mismo presupuesto y mismo motivo que `vehicle-service`: 12000ms en el
+    # peor caso, sin dependencia externa que repartir.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       # Deliberadamente SIN `app-attestation`: decisión cerrada del
       # contrato de US-05, por velocidad. Sin esa capa, `rate-limiting`
@@ -451,9 +480,11 @@ services:
     # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
     # ante una respuesta del upstream.
     retries: 1
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Mismo presupuesto y mismo motivo que `vehicle-service`: 12000ms en el
+    # peor caso, sin dependencia externa que repartir.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       # Alta de token. Sin `app-attestation` — mismo criterio que /vehicles y
       # /alerts: la sesión (jwt + token-offloading) ya exige un Access Token
