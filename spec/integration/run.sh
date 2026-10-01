@@ -15,6 +15,11 @@ readonly NETWORK=vv-integration
 readonly GATEWAY=vv-it-gateway
 readonly STUB=vv-it-google
 readonly UPSTREAM=vv-it-upstream
+# Segundo Gateway y upstream dedicados a la sección de resiliencia (K2):
+# aislados del Gateway principal para no interferir con el resto de la
+# suite — ver esa sección, al final de "Casos".
+readonly GATEWAY_SLOW=vv-it-gateway-slow
+readonly SLOW_UPSTREAM=vv-it-slow-upstream
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 readonly JWT_ISSUER=vinculo-vial-identity
 
@@ -34,7 +39,8 @@ to_host_path() {
 failures=0
 
 cleanup() {
-  docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" >/dev/null 2>&1 || true
+  docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" \
+    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -998,6 +1004,70 @@ check "quince DELETE seguidos del mismo usuario pasan todos (0 con status distin
 # compartido entre Routes) todavía tiene que pasar.
 check "el alta (POST) sigue funcionando para ese usuario tras la ráfaga de bajas" \
   200 "$(notifications_post_status "${del_rl_token}" "${notif_body}")"
+
+echo
+echo "Resiliencia (K2): reintentos de Kong ante un upstream interno lento"
+
+# Gateway y upstream dedicados, aislados del resto de la suite: ninguno de los
+# tres Services restantes se ejercita acá, así que apuntan a destinos
+# inválidos, mismo patrón que usa el job "Configuración declarativa" de CI.
+# Reutiliza el par JWT ya generado (jwt_public_key_escaped / sign_jwt): no
+# hace falta uno nuevo para que este Gateway acepte valid_token-equivalentes.
+echo "==> Levantando un upstream deliberadamente lento"
+docker run -d --name "${SLOW_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/slow-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/slow/logs && exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/slow -g "daemon off;"' \
+  >/dev/null
+
+echo "==> Levantando un segundo Gateway para la prueba de timeout/reintentos"
+docker run -d --name "${GATEWAY_SLOW}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${SLOW_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_SLOW}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_SLOW}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El segundo Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_SLOW}"
+  exit 1
+fi
+
+slow_user="5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"
+slow_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${slow_user}\",\"exp\":$((now + 300))}")"
+
+timeout_status="$(docker exec "${GATEWAY_SLOW}" curl -s -o /dev/null -w '%{http_code}' \
+  -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+  -H "Authorization: Bearer ${slow_token}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${notif_body}")"
+
+# Comportamiento nativo de Kong ante un timeout de upstream interno: 504, no
+# 503. El contrato de resiliencia de la plataforma reserva esa diferencia
+# deliberadamente para este caso (ver README).
+check "un upstream que no responde dentro de read_timeout corta con 504" \
+  504 "${timeout_status}"
+
+slow_invocations="$(docker logs "${SLOW_UPSTREAM}" 2>&1 \
+  | grep -c 'slow-upstream: invocacion recibida' || true)"
+check "el upstream lento recibe exactamente 1 invocación pese a retries: 1" \
+  1 "${slow_invocations}"
 
 echo
 if (( failures > 0 )); then
