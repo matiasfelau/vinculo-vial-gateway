@@ -120,23 +120,38 @@ describe("service account de Google", function()
     it("reporta el status sin filtrar el cuerpo del error", function()
       -- El error de Google puede describir el service account: al log va el
       -- status, no el detalle.
-      local token, reason = google_oauth.parse_token_response(
+      local token, reason, kind = google_oauth.parse_token_response(
         400, '{"error":"invalid_grant","error_description":"Invalid JWT Signature"}')
 
       assert.is_nil(token)
       assert.equals("oauth_http_400", reason)
+      -- Un 4xx es un problema de la aserción o las credenciales del Gateway,
+      -- nunca "Google está caído": no cuenta como falla de dependencia.
+      assert.equals("rejected", kind)
+    end)
+
+    it("clasifica un 5xx de Google como falla de dependencia", function()
+      local token, reason, kind = google_oauth.parse_token_response(503, "unavailable")
+
+      assert.is_nil(token)
+      assert.equals("oauth_http_503", reason)
+      assert.equals("upstream_error", kind)
     end)
 
     it("rechaza un 200 sin access token", function()
-      local token, reason = google_oauth.parse_token_response(200, '{"token_type":"Bearer"}')
+      local token, reason, kind = google_oauth.parse_token_response(200, '{"token_type":"Bearer"}')
       assert.is_nil(token)
       assert.equals("oauth_missing_access_token", reason)
+      -- Un 200 sin lo que el contrato promete es un cuerpo fuera de
+      -- contrato, igual que un 5xx.
+      assert.equals("upstream_error", kind)
     end)
 
     it("rechaza un 200 que no es JSON", function()
-      local token, reason = google_oauth.parse_token_response(200, "<html>")
+      local token, reason, kind = google_oauth.parse_token_response(200, "<html>")
       assert.is_nil(token)
       assert.equals("oauth_malformed_response", reason)
+      assert.equals("upstream_error", kind)
     end)
   end)
 end)

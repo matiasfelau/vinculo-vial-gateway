@@ -446,8 +446,22 @@ echo "Errores de Google"
 
 check "un token que Google rechaza se traduce en 403" \
   403 "$(signup_status "REJECT" '{}')"
-check "un error 5xx de Google falla cerrado" \
-  403 "$(signup_status "BOOM" '{}')"
+# Un 5xx de Google no es un veredicto negativo: es la dependencia caída.
+# Tratarlo como invalid_attestation le haría creer al cliente que SU
+# dispositivo es el problema, cuando en realidad es transitorio y ajeno a él.
+check "un error 5xx de Google se traduce en 502, no en un veredicto negativo" \
+  502 "$(signup_status "BOOM" '{}')"
+
+boom_rejection="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+  -H 'X-App-Attestation: BOOM' -d '{}')"
+
+check_contains "la falla de dependencia declara el error del contrato" \
+  '"error":"bad_gateway"' "${boom_rejection}"
+check_contains "la falla de dependencia declara el motivo público del contrato" \
+  '"reason":"dependency_error"' "${boom_rejection}"
+check_not_contains "la falla de dependencia no filtra el motivo interno" \
+  "playintegrity" "${boom_rejection}"
 
 echo
 echo "Tamaño del payload"
