@@ -114,21 +114,24 @@ end
 
 --- Interpreta la respuesta del endpoint de token. Pura, para poder testearla.
 -- @return string access_token, number vida en segundos
--- @return nil, string motivo del fallo
+-- @return nil, string motivo del fallo, string clasificación del fallo
+--         ("upstream_error" si Google respondió 5xx o un cuerpo fuera de
+--         contrato; "rejected" para cualquier otro caso, el default seguro)
 function M.parse_token_response(status, body)
   if status ~= 200 then
     -- El cuerpo del error de Google no contiene datos del usuario, pero sí
     -- puede traer detalles del service account: se reporta sólo el status.
-    return nil, "oauth_http_" .. tostring(status)
+    local kind = status >= 500 and "upstream_error" or "rejected"
+    return nil, "oauth_http_" .. tostring(status), kind
   end
 
   local parsed = cjson.decode(body)
   if type(parsed) ~= "table" then
-    return nil, "oauth_malformed_response"
+    return nil, "oauth_malformed_response", "upstream_error"
   end
 
   if type(parsed.access_token) ~= "string" or parsed.access_token == "" then
-    return nil, "oauth_missing_access_token"
+    return nil, "oauth_missing_access_token", "upstream_error"
   end
 
   return parsed.access_token, tonumber(parsed.expires_in) or ASSERTION_LIFETIME
@@ -156,6 +159,10 @@ local function cache_set(token, expires_in)
 end
 
 --- Devuelve un access token válido, del caché o pidiéndole uno nuevo a Google.
+-- @return string access_token
+-- @return nil, string motivo del fallo, string clasificación del fallo (ver
+--         `parse_token_response`; "unavailable" si Google fue inalcanzable o
+--         no respondió dentro de `http_timeout_ms`)
 function M.get_access_token(conf)
   local cached = cache_get()
   if cached then
@@ -164,12 +171,12 @@ function M.get_access_token(conf)
 
   local account, account_err = M.load_service_account(conf)
   if not account then
-    return nil, account_err
+    return nil, account_err, "rejected"
   end
 
   local assertion, assertion_err = M.build_assertion(account, ngx.time())
   if not assertion then
-    return nil, assertion_err
+    return nil, assertion_err, "rejected"
   end
 
   local client = http.new()
@@ -186,12 +193,12 @@ function M.get_access_token(conf)
   })
 
   if not res then
-    return nil, "oauth_unreachable: " .. tostring(request_err)
+    return nil, "oauth_unreachable: " .. tostring(request_err), "unavailable"
   end
 
-  local token, expires_in = M.parse_token_response(res.status, res.body)
+  local token, expires_in, kind = M.parse_token_response(res.status, res.body)
   if not token then
-    return nil, expires_in
+    return nil, expires_in, kind
   end
 
   cache_set(token, expires_in)

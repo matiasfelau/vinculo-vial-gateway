@@ -15,30 +15,34 @@ local M = {}
 --- Interpreta la respuesta de `decodeIntegrityToken`. Pura, para testearla
 --- sin red.
 -- @return table `tokenPayloadExternal`
--- @return nil, string motivo interno del rechazo
+-- @return nil, string motivo interno del rechazo, string clasificación del
+--         fallo ("upstream_error" si Google respondió 5xx o un cuerpo fuera
+--         de contrato; "rejected" para un token inválido o un problema de
+--         credenciales del Gateway — ninguno de los dos es "Google caído")
 function M.parse_response(status, body)
   if status == 400 then
     -- Google rechaza el token: manipulado, de otra app, o ya expirado.
-    return nil, "playintegrity_token_rejected"
+    return nil, "playintegrity_token_rejected", "rejected"
   end
 
   if status == 401 or status == 403 then
     -- Problema de credenciales del Gateway, no del cliente.
-    return nil, "playintegrity_unauthorized"
+    return nil, "playintegrity_unauthorized", "rejected"
   end
 
   if status ~= 200 then
-    return nil, "playintegrity_http_" .. tostring(status)
+    local kind = status >= 500 and "upstream_error" or "rejected"
+    return nil, "playintegrity_http_" .. tostring(status), kind
   end
 
   local parsed = cjson.decode(body)
   if type(parsed) ~= "table" then
-    return nil, "playintegrity_malformed_response"
+    return nil, "playintegrity_malformed_response", "upstream_error"
   end
 
   local payload = parsed.tokenPayloadExternal
   if type(payload) ~= "table" then
-    return nil, "playintegrity_missing_payload"
+    return nil, "playintegrity_missing_payload", "upstream_error"
   end
 
   return payload
@@ -48,11 +52,13 @@ end
 -- @param token string token opaco emitido por Play Integrity en el dispositivo
 -- @param conf table configuración del plugin
 -- @return table veredicto canónico
--- @return nil, string motivo interno del rechazo
+-- @return nil, string motivo interno del rechazo, string clasificación del
+--         fallo (ver `parse_response`; "unavailable" si Google o el canje de
+--         OAuth previo fueron inalcanzables o no respondieron a tiempo)
 function M.fetch(token, conf)
-  local access_token, oauth_err = google_oauth.get_access_token(conf)
+  local access_token, oauth_err, oauth_kind = google_oauth.get_access_token(conf)
   if not access_token then
-    return nil, oauth_err
+    return nil, oauth_err, oauth_kind
   end
 
   local url = conf.playintegrity_url
@@ -74,9 +80,11 @@ function M.fetch(token, conf)
   })
 
   if not res then
-    -- Google inalcanzable. Se falla cerrado: sin veredicto no se deja pasar
-    -- tráfico a la red interna, que es justamente lo que este plugin protege.
-    return nil, "playintegrity_unreachable: " .. tostring(request_err)
+    -- Google inalcanzable. El perímetro sigue fallando cerrado (sin veredicto
+    -- no se deja pasar tráfico a la red interna), pero el motivo que se le
+    -- reporta al cliente ahora distingue esto de un veredicto negativo: ver
+    -- `kind` más abajo y el handler, que lo traduce a 503 en vez de 403.
+    return nil, "playintegrity_unreachable: " .. tostring(request_err), "unavailable"
   end
 
   return M.parse_response(res.status, res.body)

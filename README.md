@@ -648,16 +648,34 @@ Los rechazos generados por los plugins propios comparten una única forma
 |---|---|---|---|
 | Atestación ausente, mal formada, con firma inválida, expirada o con veredicto rechazado | `403` | `forbidden` | `invalid_attestation` |
 | JWT de sesión del que no se puede derivar identidad | `401` | `unauthorized` | `invalid_token` |
+| Google/Play Integrity inalcanzable o sin respuesta dentro de `http_timeout_ms` | `503` | `service_unavailable` | `dependency_unavailable` |
+| Google/Play Integrity respondió `5xx`, o un `200` con un cuerpo fuera de contrato | `502` | `bad_gateway` | `dependency_error` |
 
 El motivo real (`invalid_signature`, `expired_token`, `device_verdict_rejected`,
 …) va **sólo al log**: distinguirlos en la respuesta le diría a quien está
 sondeando el control exactamente qué validación tocó. Nunca se loguea el token
 ni la PSK.
 
+Las dos últimas filas son deliberadamente distintas de `invalid_attestation`:
+una dependencia caída o que responde fuera de contrato no es un veredicto
+negativo sobre el dispositivo del cliente, y tratarla como tal le haría creer
+que el problema es suyo (no reintentable) cuando en realidad es transitorio y
+ajeno a él. La distinción es posible porque `app-attestation` es código propio
+que puede clasificar la falla antes de responder; no existe un mecanismo
+equivalente para interceptar la respuesta nativa de Kong (ver nota siguiente).
+
 > Los rechazos que produce el propio Kong (`429` de rate limiting, `401` del
-> plugin `jwt`, `404` sin Route, `502/503` del upstream) conservan su formato
-> nativo `{"message": "..."}`. Unificarlos requeriría reescribir las respuestas
-> de error de Kong y queda fuera del alcance de US-01.
+> plugin `jwt`, `404` sin Route) conservan su formato nativo
+> `{"message": "..."}`. Unificarlos requeriría reescribir las respuestas de
+> error de Kong y queda fuera de alcance.
+>
+> Un upstream interno (`identity-service`, `vehicle-service`, `alert-service`,
+> `notification-service`) que no responde dentro de su `read_timeout` recibe
+> `504` de Kong — no `503` — porque el proxy nativo de Kong, a diferencia del
+> cliente HTTP propio que usa `app-attestation` contra Google, no ofrece un
+> punto donde reclasificar ese código antes de responder. Es una excepción
+> deliberada y documentada al criterio general de la plataforma (503 =
+> dependencia propia no disponible), no una inconsistencia pendiente.
 
 ## Convenciones
 
