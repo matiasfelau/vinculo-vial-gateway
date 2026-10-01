@@ -159,11 +159,16 @@ local function cache_set(token, expires_in)
 end
 
 --- Devuelve un access token válido, del caché o pidiéndole uno nuevo a Google.
+-- @param conf table configuración del plugin
+-- @param timeout_ms number techo de esta llamada en ms. Lo decide el llamador
+--        (`sources/google.fetch`) según cuánto quede del presupuesto agregado
+--        del par de llamadas; por defecto `dependency_call_timeout_ms`, para
+--        que la función siga siendo segura si algún día se llama sola.
 -- @return string access_token
 -- @return nil, string motivo del fallo, string clasificación del fallo (ver
 --         `parse_token_response`; "unavailable" si Google fue inalcanzable o
---         no respondió dentro de `http_timeout_ms`)
-function M.get_access_token(conf)
+--         no respondió dentro de `timeout_ms`)
+function M.get_access_token(conf, timeout_ms)
   local cached = cache_get()
   if cached then
     return cached
@@ -180,7 +185,7 @@ function M.get_access_token(conf)
   end
 
   local client = http.new()
-  client:set_timeout(conf.http_timeout_ms)
+  client:set_timeout(timeout_ms or conf.dependency_call_timeout_ms)
 
   local res, request_err = client:request_uri(account.token_uri, {
     method = "POST",

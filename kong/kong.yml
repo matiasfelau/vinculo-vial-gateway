@@ -96,6 +96,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-02 — Login. Mismo esquema de body que signup: sobre HPKE, el
       # Gateway no lo inspecciona ni lo modifica, sólo lo reenvía. Identity
@@ -149,6 +154,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-03 — Gestión de Sesión (RTR). El body es `{ "refresh_token": "<...>" }`,
       # un string opaco SIN el sobre HPKE de signup/signin: la confidencialidad
@@ -191,6 +201,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # Deliberadamente SIN `app-attestation`: cerrar sesión es una acción de
       # seguridad del usuario, no una operación que emita credenciales nuevas.
