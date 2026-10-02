@@ -24,6 +24,12 @@ readonly SLOW_UPSTREAM=vv-it-slow-upstream
 # balanceo y del presupuesto de las llamadas a Google (ver "Resiliencia (Ola 5)").
 readonly GATEWAY_RESILIENCE=vv-it-gateway-resilience
 readonly FLAKY_UPSTREAM=vv-it-flaky-upstream
+# Cuarto Gateway (sin sondeo activo de targets sanos, para que sólo el
+# healthcheck pasivo pueda sacar un target del balanceo) y un upstream que
+# arranca con el puerto cerrado, para la recuperación de targets marcados por
+# el pasivo.
+readonly GATEWAY_PASSIVE=vv-it-gateway-passive
+readonly LATE_UPSTREAM=vv-it-late-upstream
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 readonly JWT_ISSUER=vinculo-vial-identity
 
@@ -44,7 +50,8 @@ failures=0
 
 cleanup() {
   docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" \
-    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" "${GATEWAY_RESILIENCE}" "${FLAKY_UPSTREAM}" >/dev/null 2>&1 || true
+    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" "${GATEWAY_RESILIENCE}" "${FLAKY_UPSTREAM}" \
+    "${GATEWAY_PASSIVE}" "${LATE_UPSTREAM}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -1303,6 +1310,173 @@ check "con el circuito abierto, cada request recibe 503 (0 con status distinto)"
   0 "${open_not_503}"
 check "con el circuito abierto, ninguna request llega al upstream" \
   "${upstream_before}" "$(flaky_invocations)"
+
+echo
+echo "Recuperación: un target no sano vuelve al balanceo cuando /ready se recupera"
+
+# Sin esto, un `unhealthy.interval` en 0 deja el target fuera para siempre:
+# Kong no vuelve a sondearlo, y un corte breve de la base propia del servicio
+# lo saca del balanceo de forma permanente. Las rutas de negocio siguen
+# respondiendo 400, así que un 400 sólo puede venir del upstream: es la
+# prueba de que la request volvió a llegar.
+flaky_control "ready=200"
+
+recovered_status=""
+for _ in $(seq 1 30); do
+  recovered_status="$(resilience_delete_status "${res_token}")"
+  if [[ "${recovered_status}" != "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al recuperarse /ready, el target marcado por el activo vuelve al balanceo" \
+  400 "${recovered_status}"
+
+echo
+echo "Recuperación: targets marcados por el healthcheck pasivo (timeouts y errores de conexión)"
+
+# Cuarto Gateway, con el sondeo de targets SANOS apagado (healthy.interval = 0):
+# sin él, el activo marcaría el target al instante y no habría forma de
+# distinguir quién lo sacó del balanceo. Así sólo el pasivo puede hacerlo, y
+# el activo (unhealthy.interval, 1s) queda como único camino de regreso. Que
+# la primera request llegue al upstream aunque /ready ya esté no sano es la
+# verificación de ese aislamiento.
+echo "==> Levantando un upstream con el puerto cerrado"
+docker run -d --name "${LATE_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/flaky-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/flaky/logs && exec sleep infinity' \
+  >/dev/null
+
+echo "==> Levantando un cuarto Gateway para la prueba del healthcheck pasivo"
+docker run -d --name "${GATEWAY_PASSIVE}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://${LATE_UPSTREAM}:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 \
+  -e UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD=1 \
+  -e UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD=2 \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_PASSIVE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_PASSIVE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El cuarto Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_PASSIVE}"
+  exit 1
+fi
+
+passive_delete_status() {
+  docker exec "${GATEWAY_PASSIVE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE http://127.0.0.1:8000/api/v1/notifications/tokens \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+passive_vehicles_status() {
+  docker exec "${GATEWAY_PASSIVE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/vehicles \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+# Timeouts: el upstream demora 12000ms (el read_timeout de notification-service
+# es de 9000) y /ready ya está no sano. Dos requests en paralelo alcanzan el
+# umbral de 2 timeouts en un solo read_timeout.
+flaky_control "ready=503&business=200&delay=12000"
+
+timeout_file_1="$(mktemp)"
+timeout_file_2="$(mktemp)"
+passive_delete_status "${res_token}" > "${timeout_file_1}" &
+timeout_pid_1=$!
+passive_delete_status "${res_token}" > "${timeout_file_2}" &
+timeout_pid_2=$!
+wait "${timeout_pid_1}"
+wait "${timeout_pid_2}"
+
+check "con /ready no sano pero sin sondeo de targets sanos, la request llega al upstream y corta por timeout (504)" \
+  504 "$(cat "${timeout_file_1}")"
+check "la segunda request en paralelo también corta por timeout (504)" \
+  504 "$(cat "${timeout_file_2}")"
+rm -f "${timeout_file_1}" "${timeout_file_2}"
+
+# /ready sigue no sano, así que el activo no lo devuelve todavía: el 503 sólo
+# puede ser la marca del pasivo.
+check "los timeouts marcan el target como no sano: 503 del balanceador" \
+  503 "$(passive_delete_status "${res_token}")"
+
+flaky_control "ready=200&delay=0"
+
+passive_timeout_recovered=""
+for _ in $(seq 1 30); do
+  passive_timeout_recovered="$(passive_delete_status "${res_token}")"
+  if [[ "${passive_timeout_recovered}" != "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al recuperarse /ready, el target marcado por timeouts vuelve al balanceo" \
+  200 "${passive_timeout_recovered}"
+
+# Errores de conexión: vehicle-service apunta a un contenedor que existe pero
+# no tiene nada escuchando (conexión rechazada). Por el mismo motivo que arriba,
+# la primera request llega al upstream y falla por conexión (502). Kong le
+# reporta al pasivo un solo fallo por request (el final, no cada reintento),
+# así que el umbral de 2 lo cruza la segunda request, que todavía recibe 502:
+# el 503 del balanceador recién llega en la tercera.
+check "con el puerto cerrado, la request falla por conexión (502) y no por el balanceador" \
+  502 "$(passive_vehicles_status "${res_token}")"
+check "la segunda falla por conexión también (502): cruza el umbral de 2" \
+  502 "$(passive_vehicles_status "${res_token}")"
+check "los errores de conexión marcan el target como no sano: 503 del balanceador" \
+  503 "$(passive_vehicles_status "${res_token}")"
+
+# El upstream empieza a escuchar: el activo lo detecta y lo devuelve.
+docker exec -d "${LATE_UPSTREAM}" sh -c \
+  'exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/flaky -g "daemon off;"'
+
+passive_tcp_recovered=""
+for _ in $(seq 1 30); do
+  passive_tcp_recovered="$(passive_vehicles_status "${res_token}")"
+  if [[ "${passive_tcp_recovered}" == "200" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al empezar a escuchar el puerto, el target marcado por errores de conexión vuelve al balanceo" \
+  200 "${passive_tcp_recovered}"
+
+echo
+echo "Guardia de arranque: el intervalo de sondeo de targets no sanos no puede ser 0"
+
+guard_output="$(docker run --rm \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=0 \
+  vinculo-vial-gateway:integration 2>&1 || true)"
+
+check_contains "con UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=0 el Gateway no arranca" \
+  "UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS debe ser un entero positivo" "${guard_output}"
 
 echo
 if (( failures > 0 )); then
