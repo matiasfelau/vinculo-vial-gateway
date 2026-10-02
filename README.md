@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 111 de integración | ✅ |
+| CI: 104 tests unitarios + 120 de integración | ✅ |
 
 ## Estructura
 
@@ -766,6 +766,24 @@ ninguna request toque el upstream. La misma sección verifica, contra el stub
 de Google, el reparto del presupuesto de 4000ms entre el canje de OAuth y
 `decodeIntegrityToken`, y que un Google colgado corta en `503` y nunca
 espera indefinidamente.
+
+### Recuperación
+
+Un target que salió del balanceo vuelve cuando `/ready` se recupera, sea cual
+sea la causa de la salida: lo fija la suite con tres casos (marcado por el
+activo, por timeouts del pasivo y por errores de conexión del pasivo). Lo
+único que lo permite es que el activo siga sondeando los targets no sanos:
+con `healthchecks.active.unhealthy.interval` en `0` Kong no los vuelve a
+probar y un corte breve de la base del servicio lo dejaría fuera para
+siempre. Por eso `UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS` (que gobierna ese
+intervalo) tiene que ser un entero positivo y el Gateway no arranca con otro
+valor.
+
+`UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS` rige, en cambio, el sondeo de
+los targets sanos (`healthy.interval`). Con `0` ese sondeo se apaga y la
+salida del balanceo depende sólo del pasivo; la recuperación sigue siendo por
+el activo. La suite lo usa así para aislar los casos del pasivo; el valor por
+defecto (10) deja ambos sondeos encendidos.
 
 ## Convenciones
 
