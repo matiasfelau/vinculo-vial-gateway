@@ -722,32 +722,41 @@ sola agotar el presupuesto del par.
 
 Los cuatro Services (`identity-service`, `vehicle-service`, `alert-service`,
 `notification-service`) resuelven contra un `Upstream` propio con dos
-healthchecks, no uno:
+healthchecks, no uno. La salud de la instancia la decide el activo:
 
 - **Activo**, contra `GET /ready` de cada servicio, directo al target — por
   fuera de cualquier Route de Kong, igual que `/internal/*`: no es tráfico
-  público, así que no necesita (ni puede tener) una Route. Detecta una caída
-  aunque no haya tráfico real.
+  público, así que no necesita (ni puede tener) una Route. `/ready` chequea
+  sólo la base propia del servicio. Detecta una caída aunque no haya tráfico
+  real, y es lo único que cuenta respuestas HTTP: un `5xx` de `/ready` suma
+  una falla.
 - **Pasivo**, sobre el tráfico real que ya proxea el Gateway. Reacciona más
-  rápido que el intervalo del activo cuando hay tráfico, y con el mismo
-  criterio del resto del contrato: cuentan `5xx`, timeout o error de
-  conexión; un `4xx` nunca cuenta.
+  rápido que el intervalo del activo cuando hay tráfico, pero sólo cuenta
+  fallas de transporte: error de conexión y timeout. **Nunca el status HTTP**
+  (`http_failures: 0`).
 
-Ninguno sustituye al otro. Kong no tiene un "tiempo de apertura" separado
-como otros circuit breakers: un target marcado no sano se vuelve a probar al
-mismo intervalo del healthcheck activo (`UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS`,
-10s por defecto), y recién vuelve a sano tras acumular
-`UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD` (2) éxitos consecutivos. Esa
-duración de apertura es ese intervalo multiplicado por ese umbral, no un
-valor propio — es lo más parecido a esa noción que ofrece el mecanismo
-nativo de Kong. `UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD` (3) rige tanto el
-umbral de fallas HTTP como el de errores de conexión y timeouts, para los
-dos healthchecks por igual.
+El pasivo no cuenta HTTP porque un `503` emitido por un servicio es
+contención por ruta: una dependencia caída detrás de su propio breaker, no
+una instancia enferma. Si contara, sacaría del balanceo a la instancia
+entera y con ella a las rutas que sí funcionan (RENAPER caído → `signup`
+`503` → Identity fuera del balanceo → se cae también `signin`). Un `4xx`
+tampoco cuenta, por la misma razón.
+
+Kong no tiene un "tiempo de apertura" separado como otros circuit breakers:
+un target marcado no sano se vuelve a probar al mismo intervalo del
+healthcheck activo (`UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS`, 10s por defecto),
+y recién vuelve a sano tras acumular `UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD`
+(2) éxitos consecutivos. Esa duración de apertura es ese intervalo
+multiplicado por ese umbral, no un valor propio — es lo más parecido a esa
+noción que ofrece el mecanismo nativo de Kong.
+`UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD` (3) rige las fallas consecutivas
+de `/ready` en el activo y los errores de conexión y timeouts en el pasivo.
 
 Con un target marcado no sano, Kong responde `503` sin intentar la conexión
-— el caso "circuito abierto" del contrato. Es distinto del `504` de
-"Contrato de error" más arriba, que es el timeout de una request puntual
-contra un target que sigue sano.
+— el caso "circuito abierto" del contrato. Es distinto de un `503` emitido
+por el propio servicio (que Kong reenvía tal cual sin sacarlo del balanceo)
+y del `504` de "Contrato de error" más arriba, que es el timeout de una
+request puntual contra un target que sigue sano.
 
 ## Convenciones
 
