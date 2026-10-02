@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 120 de integración | ✅ |
+| CI: 104 tests unitarios + 121 de integración | ✅ |
 
 ## Estructura
 

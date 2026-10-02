@@ -1440,9 +1440,13 @@ check "al recuperarse /ready, el target marcado por timeouts vuelve al balanceo"
 
 # Errores de conexión: vehicle-service apunta a un contenedor que existe pero
 # no tiene nada escuchando (conexión rechazada). Por el mismo motivo que arriba,
-# la primera request llega al upstream y falla por conexión (502), y el
-# segundo fallo del reintento alcanza el umbral.
+# la primera request llega al upstream y falla por conexión (502). Kong le
+# reporta al pasivo un solo fallo por request (el final, no cada reintento),
+# así que el umbral de 2 lo cruza la segunda request, que todavía recibe 502:
+# el 503 del balanceador recién llega en la tercera.
 check "con el puerto cerrado, la request falla por conexión (502) y no por el balanceador" \
+  502 "$(passive_vehicles_status "${res_token}")"
+check "la segunda falla por conexión también (502): cruza el umbral de 2" \
   502 "$(passive_vehicles_status "${res_token}")"
 check "los errores de conexión marcan el target como no sano: 503 del balanceador" \
   503 "$(passive_vehicles_status "${res_token}")"
