@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 94 tests unitarios + 93 de integración | ✅ |
+| CI: 95 tests unitarios + 97 de integración | ✅ |
 
 ## Estructura
 
@@ -650,19 +650,28 @@ Los rechazos generados por los plugins propios comparten una única forma
 | JWT de sesión del que no se puede derivar identidad | `401` | `unauthorized` | `invalid_token` |
 | Google/Play Integrity inalcanzable, o sin respuesta dentro del presupuesto del par de llamadas | `503` | `service_unavailable` | `dependency_unavailable` |
 | Google/Play Integrity respondió `5xx`, o un `200` con un cuerpo fuera de contrato | `502` | `bad_gateway` | `dependency_error` |
+| Credenciales o configuración propias inválidas frente a Google (access token rechazado, service account ilegible) | `500` | `internal_error` | `gateway_fault` |
 
 El motivo real (`invalid_signature`, `expired_token`, `device_verdict_rejected`,
 …) va **sólo al log**: distinguirlos en la respuesta le diría a quien está
 sondeando el control exactamente qué validación tocó. Nunca se loguea el token
 ni la PSK.
 
-Las dos últimas filas son deliberadamente distintas de `invalid_attestation`:
-una dependencia caída o que responde fuera de contrato no es un veredicto
-negativo sobre el dispositivo del cliente, y tratarla como tal le haría creer
-que el problema es suyo (no reintentable) cuando en realidad es transitorio y
-ajeno a él. La distinción es posible porque `app-attestation` es código propio
-que puede clasificar la falla antes de responder; no existe un mecanismo
-equivalente para interceptar la respuesta nativa de Kong (ver nota siguiente).
+Las tres últimas filas son deliberadamente distintas de `invalid_attestation`:
+- Una dependencia caída o que responde fuera de contrato no es un veredicto
+  negativo sobre el dispositivo del cliente, y tratarla como tal le haría
+  creer que el problema es suyo (no reintentable) cuando en realidad es
+  transitorio y ajeno a él.
+- Una credencial propia inválida (el access token de OAuth que el propio
+  Gateway le presenta a Play Integrity, o el service account del que sale
+  ese token) tampoco es culpa del cliente ni una dependencia caída: es un
+  defecto de configuración de este lado. Expulsar al cliente con un `403`
+  por un error nuestro, además de ser engañoso, le oculta el incidente al
+  operador detrás de una señal que sugiere "dispositivo no confiable".
+
+La distinción es posible porque `app-attestation` es código propio que puede
+clasificar la falla antes de responder; no existe un mecanismo equivalente
+para interceptar la respuesta nativa de Kong (ver nota siguiente).
 
 > Los rechazos que produce el propio Kong (`429` de rate limiting, `401` del
 > plugin `jwt`, `404` sin Route) conservan su formato nativo
@@ -681,13 +690,15 @@ equivalente para interceptar la respuesta nativa de Kong (ver nota siguiente).
 
 Cada request que atraviesa el Gateway tiene un techo de 12000ms en el peor
 caso: `2 × connect_timeout + read_timeout` (el `2 ×` es por el reintento de
-`retries: 1` ante un fallo de conexión; `write_timeout` no participa porque un
-upstream sano en la misma red no se estanca escribiendo, sólo conectando o
-leyendo — verificado en la suite de integración, ver "Resiliencia (K2)").
+`retries: 1` ante un fallo de conexión; `write_timeout` no participa —
+mide tiempo ENTRE escrituras sucesivas al upstream, no la transferencia
+total, y con el body ya bufferizado por Kong antes de reenviarlo, ni la
+selfie de signup lo dispara en una red interna. Verificado en la suite de
+integración, ver "Resiliencia (K2)").
 
 | Service | `connect_timeout` | `read_timeout` | `write_timeout` | Peor caso |
 |---|---|---|---|---|
-| `identity-service` | 1000 | 6000 | 15000 | 8000 |
+| `identity-service` | 1000 | 6000 | 6000 | 8000 |
 | `vehicle-service` | 1000 | 9000 | 9000 | 11000 |
 | `alert-service` | 1000 | 9000 | 9000 | 11000 |
 | `notification-service` | 1000 | 9000 | 9000 | 11000 |
@@ -696,10 +707,7 @@ leyendo — verificado en la suite de integración, ver "Resiliencia (K2)").
 `/auth/signin`, `/auth/refresh`) además cargan `app-attestation`, que reparte
 el resto del presupuesto (hasta 4000ms) contra Google: `8000 + 4000 = 12000`.
 Las otras tres Routes no tienen esa dependencia y usan el presupuesto
-completo. El `write_timeout` de `identity-service` queda sin acotar porque el
-body de signup lleva una selfie y necesita margen para subir, no para que
-Identity responda — no entra en la cuenta del peor caso por el motivo de
-arriba.
+completo.
 
 Dentro de `app-attestation`, el canje de OAuth y el POST a
 `decodeIntegrityToken` comparten un presupuesto agregado de 4000ms
@@ -709,6 +717,37 @@ común, dura una hora) el primero ni ocurre, así que el segundo dispone del
 agregado completo. Cada llamada además respeta un techo individual de 3000ms
 (`ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS`), para que ninguna de las dos pueda
 sola agotar el presupuesto del par.
+
+## Healthchecks de los upstreams
+
+Los cuatro Services (`identity-service`, `vehicle-service`, `alert-service`,
+`notification-service`) resuelven contra un `Upstream` propio con dos
+healthchecks, no uno:
+
+- **Activo**, contra `GET /ready` de cada servicio, directo al target — por
+  fuera de cualquier Route de Kong, igual que `/internal/*`: no es tráfico
+  público, así que no necesita (ni puede tener) una Route. Detecta una caída
+  aunque no haya tráfico real.
+- **Pasivo**, sobre el tráfico real que ya proxea el Gateway. Reacciona más
+  rápido que el intervalo del activo cuando hay tráfico, y con el mismo
+  criterio del resto del contrato: cuentan `5xx`, timeout o error de
+  conexión; un `4xx` nunca cuenta.
+
+Ninguno sustituye al otro. Kong no tiene un "tiempo de apertura" separado
+como otros circuit breakers: un target marcado no sano se vuelve a probar al
+mismo intervalo del healthcheck activo (`UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS`,
+10s por defecto), y recién vuelve a sano tras acumular
+`UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD` (2) éxitos consecutivos. Esa
+duración de apertura es ese intervalo multiplicado por ese umbral, no un
+valor propio — es lo más parecido a esa noción que ofrece el mecanismo
+nativo de Kong. `UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD` (3) rige tanto el
+umbral de fallas HTTP como el de errores de conexión y timeouts, para los
+dos healthchecks por igual.
+
+Con un target marcado no sano, Kong responde `503` sin intentar la conexión
+— el caso "circuito abierto" del contrato. Es distinto del `504` de
+"Contrato de error" más arriba, que es el timeout de una request puntual
+contra un target que sigue sano.
 
 ## Convenciones
 
