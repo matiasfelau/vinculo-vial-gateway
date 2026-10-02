@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 95 tests unitarios + 97 de integración | ✅ |
+| CI: 104 tests unitarios + 111 de integración | ✅ |
 
 ## Estructura
 
@@ -757,6 +757,15 @@ Con un target marcado no sano, Kong responde `503` sin intentar la conexión
 por el propio servicio (que Kong reenvía tal cual sin sacarlo del balanceo)
 y del `504` de "Contrato de error" más arriba, que es el timeout de una
 request puntual contra un target que sigue sano.
+
+La suite de integración (sección "Resiliencia (Ola 5)") fija estos tres
+comportamientos contra un upstream controlable, con el healthcheck activo
+acelerado a 1s: diez `503` repetidos del upstream (y cinco `4xx`) siguen
+llegando a él, y un `/ready` no sano devuelve `503` del balanceador sin que
+ninguna request toque el upstream. La misma sección verifica, contra el stub
+de Google, el reparto del presupuesto de 4000ms entre el canje de OAuth y
+`decodeIntegrityToken`, y que un Google colgado corta en `503` y nunca
+espera indefinidamente.
 
 ## Convenciones
 

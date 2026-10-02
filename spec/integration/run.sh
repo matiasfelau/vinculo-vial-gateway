@@ -20,6 +20,10 @@ readonly UPSTREAM=vv-it-upstream
 # suite — ver esa sección, al final de "Casos".
 readonly GATEWAY_SLOW=vv-it-gateway-slow
 readonly SLOW_UPSTREAM=vv-it-slow-upstream
+# Tercer Gateway y upstream controlable, para la sección de resiliencia del
+# balanceo y del presupuesto de las llamadas a Google (ver "Resiliencia (Ola 5)").
+readonly GATEWAY_RESILIENCE=vv-it-gateway-resilience
+readonly FLAKY_UPSTREAM=vv-it-flaky-upstream
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 readonly JWT_ISSUER=vinculo-vial-identity
 
@@ -40,7 +44,7 @@ failures=0
 
 cleanup() {
   docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" \
-    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" >/dev/null 2>&1 || true
+    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" "${GATEWAY_RESILIENCE}" "${FLAKY_UPSTREAM}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -1099,6 +1103,206 @@ slow_invocations="$(docker logs "${SLOW_UPSTREAM}" 2>&1 \
   | grep -c 'slow-upstream: invocacion recibida' || true)"
 check "el upstream lento recibe exactamente 1 invocación pese a retries: 1" \
   1 "${slow_invocations}"
+
+echo
+echo "Resiliencia (Ola 5): presupuesto de las llamadas a Google y salud de los upstreams"
+
+# Tercer Gateway, fresco (sin access token de Google en caché, que es lo que
+# permite medir el reparto del presupuesto entre el canje de OAuth y
+# decodeIntegrityToken) y con el healthcheck activo acelerado: con los valores
+# por defecto (10s de intervalo, 3 fallas) sacar un target del balanceo tardaría
+# cerca de medio minuto. Sólo notification-service apunta a un upstream real
+# (el controlable); los otros tres, a destinos inválidos como en la sección
+# anterior.
+echo "==> Levantando un upstream controlable"
+docker run -d --name "${FLAKY_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/flaky-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/flaky/logs && exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/flaky -g "daemon off;"' \
+  >/dev/null
+
+echo "==> Levantando un tercer Gateway para la prueba de resiliencia"
+docker run -d --name "${GATEWAY_RESILIENCE}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD=1 \
+  -e UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD=2 \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_RESILIENCE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_RESILIENCE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El tercer Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_RESILIENCE}"
+  exit 1
+fi
+
+# Un signup contra el tercer Gateway con el token de atestación dado. Imprime
+# el body, un salto de línea, y "<status> <segundos>". El tiempo lo mide curl
+# dentro del contenedor: no incluye el costo de `docker exec`.
+resilience_signup_timed() {
+  docker exec "${GATEWAY_RESILIENCE}" curl -s \
+    -w '\n%{http_code} %{time_total}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+    -H "X-App-Attestation: $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+# "dentro" si el valor cae en [mínimo, máximo], "fuera (<valor>s)" si no.
+in_range() {
+  awk -v t="$1" -v lo="$2" -v hi="$3" \
+    'BEGIN { print (t >= lo && t <= hi) ? "dentro" : "fuera (" t "s)" }'
+}
+
+resilience_delete_status() {
+  docker exec "${GATEWAY_RESILIENCE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE http://127.0.0.1:8000/api/v1/notifications/tokens \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+flaky_control() {
+  docker exec "${FLAKY_UPSTREAM}" curl -s -o /dev/null "http://127.0.0.1:8080/control?$1"
+}
+
+flaky_invocations() {
+  docker logs "${FLAKY_UPSTREAM}" 2>&1 | grep -c 'flaky-upstream: invocacion recibida' || true
+}
+
+echo
+echo "Presupuesto agregado de Google (OAuth + decodeIntegrityToken)"
+
+# Con el canje de OAuth demorado 2500ms (dentro de su techo de 3000) y Play
+# Integrity colgado, el par tiene que cortar a los 4000ms del agregado: la
+# segunda llamada recibe los 1500ms que quedan, no una ventana nueva de 3000
+# (que daría ~5500ms). El piso de 3.8s verifica además que la demora del
+# stub se aplicó: sin ella, Play Integrity cortaría solo a los 3000ms.
+docker exec "${STUB}" curl -s -o /dev/null "http://127.0.0.1:8080/control/token-delay?ms=2500"
+
+budget_out="$(resilience_signup_timed SLOW)"
+budget_body="${budget_out%$'\n'*}"
+read -r budget_status budget_secs <<< "${budget_out##*$'\n'}"
+
+docker exec "${STUB}" curl -s -o /dev/null "http://127.0.0.1:8080/control/token-delay?ms=0"
+
+check "un canje de OAuth lento y un decodeIntegrityToken colgado se traducen en 503" \
+  503 "${budget_status}"
+check_contains "la respuesta declara el error del contrato" \
+  '"error":"service_unavailable"' "${budget_body}"
+check_contains "la respuesta declara el motivo público del contrato" \
+  '"reason":"dependency_unavailable"' "${budget_body}"
+check "el par corta a los 4000ms del agregado, no a 2500+3000 (entre 3.8s y 4.6s)" \
+  dentro "$(in_range "${budget_secs}" 3.8 4.6)"
+
+# El access token quedó en caché por el canje anterior: ahora Play Integrity
+# dispone del techo por llamada completo, y corta ahí.
+timeout_out="$(resilience_signup_timed SLOW)"
+timeout_body="${timeout_out%$'\n'*}"
+read -r timeout_status timeout_secs <<< "${timeout_out##*$'\n'}"
+
+check "con el access token en caché, un decodeIntegrityToken colgado se traduce en 503" \
+  503 "${timeout_status}"
+check_contains "la respuesta declara el motivo público del contrato" \
+  '"reason":"dependency_unavailable"' "${timeout_body}"
+check "corta en el techo por llamada de 3000ms, nunca una espera indefinida (entre 2.8s y 3.6s)" \
+  dentro "$(in_range "${timeout_secs}" 2.8 3.6)"
+
+echo
+echo "Balanceo: un upstream que responde 5xx o 4xx sigue en el balanceo"
+
+# Lo único que decide si una instancia está en el balanceo es /ready
+# (healthcheck activo). El pasivo no cuenta el status HTTP: un 503 emitido
+# por el servicio es contención por ruta (una dependencia caída detrás de su
+# propio breaker), y si sacara a la instancia entera se caerían también las
+# rutas que sí funcionan. DELETE /notifications/tokens no tiene
+# rate-limiting, así que alcanza con un usuario para toda la sección.
+res_now="$(date +%s)"
+res_user="8e9f0a1b-2c3d-4e4f-9a5b-6c7d8e9f0a1b"
+res_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${res_user}\",\"exp\":$((res_now + 300))}")"
+
+flaky_control "ready=200&business=503"
+upstream_before="$(flaky_invocations)"
+
+# Diez, muy por encima del umbral de 2 de este Gateway. Las últimas dos van
+# después de tres intervalos del healthcheck activo: si el pasivo contara
+# HTTP, el target ya habría salido del balanceo.
+not_503=0
+for _ in $(seq 1 8); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || not_503=$((not_503 + 1))
+done
+sleep 3
+for _ in $(seq 1 2); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || not_503=$((not_503 + 1))
+done
+
+check "diez 503 repetidos del upstream se reenvían tal cual (0 con status distinto)" \
+  0 "${not_503}"
+check "ninguno lo emitió el balanceador: el upstream recibió las diez" \
+  10 "$(( $(flaky_invocations) - upstream_before ))"
+
+# Un 4xx tampoco cuenta: es responsabilidad del cliente, no una falla del
+# upstream.
+flaky_control "business=400"
+upstream_before="$(flaky_invocations)"
+
+not_400=0
+for _ in $(seq 1 5); do
+  [[ "$(resilience_delete_status "${res_token}")" == "400" ]] || not_400=$((not_400 + 1))
+done
+
+check "cinco 4xx repetidos del upstream se reenvían tal cual (0 con status distinto)" \
+  0 "${not_400}"
+check "el upstream recibió las cinco: un 4xx no abre el circuito" \
+  5 "$(( $(flaky_invocations) - upstream_before ))"
+
+echo
+echo "Balanceo: un target con /ready no sano sale del balanceo (503 sin tocar la red)"
+
+# Las rutas de negocio siguen respondiendo 400: cualquier 503 a partir de acá
+# sólo puede venir del balanceador, no del upstream.
+flaky_control "ready=503"
+
+balancer_status=""
+for _ in $(seq 1 30); do
+  balancer_status="$(resilience_delete_status "${res_token}")"
+  if [[ "${balancer_status}" == "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "con /ready no sano, el balanceador responde 503" 503 "${balancer_status}"
+
+upstream_before="$(flaky_invocations)"
+
+open_not_503=0
+for _ in $(seq 1 5); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || open_not_503=$((open_not_503 + 1))
+done
+
+check "con el circuito abierto, cada request recibe 503 (0 con status distinto)" \
+  0 "${open_not_503}"
+check "con el circuito abierto, ninguna request llega al upstream" \
+  "${upstream_before}" "$(flaky_invocations)"
 
 echo
 if (( failures > 0 )); then
