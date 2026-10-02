@@ -30,11 +30,19 @@ M.INVALID_TOKEN = "invalid_token"
 M.DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 M.DEPENDENCY_ERROR = "dependency_error"
 
+-- Defecto propio del Gateway frente a una dependencia: credenciales o
+-- configuración inválidas de ESTE lado, nunca del cliente ni de la
+-- dependencia misma. Distinto de DEPENDENCY_*: ahí la dependencia falla o
+-- incumple su contrato; acá la dependencia funciona bien y nos está
+-- rechazando a NOSOTROS.
+M.GATEWAY_FAULT = "gateway_fault"
+
 local CONTRACT = {
   [M.INVALID_ATTESTATION] = { status = 403, error = "forbidden" },
   [M.INVALID_TOKEN] = { status = 401, error = "unauthorized" },
   [M.DEPENDENCY_UNAVAILABLE] = { status = 503, error = "service_unavailable" },
   [M.DEPENDENCY_ERROR] = { status = 502, error = "bad_gateway" },
+  [M.GATEWAY_FAULT] = { status = 500, error = "internal_error" },
 }
 
 --- Arma la respuesta pública de un rechazo.

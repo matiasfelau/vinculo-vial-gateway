@@ -463,6 +463,23 @@ check_contains "la falla de dependencia declara el motivo público del contrato"
 check_not_contains "la falla de dependencia no filtra el motivo interno" \
   "playintegrity" "${boom_rejection}"
 
+# Google rechaza NUESTRO access token: defecto propio de configuración, no
+# un veredicto sobre el dispositivo del cliente ni Google caído. Expulsar al
+# cliente con un 403 acá es el bug que este caso fija como regresión.
+check "credenciales propias inválidas frente a Google se traducen en 500" \
+  500 "$(signup_status "UNAUTHORIZED" '{}')"
+
+unauthorized_rejection="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+  -H 'X-App-Attestation: UNAUTHORIZED' -d '{}')"
+
+check_contains "el defecto propio declara el error del contrato" \
+  '"error":"internal_error"' "${unauthorized_rejection}"
+check_contains "el defecto propio declara el motivo público del contrato" \
+  '"reason":"gateway_fault"' "${unauthorized_rejection}"
+check_not_contains "el defecto propio no filtra el motivo interno" \
+  "playintegrity" "${unauthorized_rejection}"
+
 echo
 echo "Tamaño del payload"
 

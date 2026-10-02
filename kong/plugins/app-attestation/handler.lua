@@ -91,8 +91,11 @@ function AppAttestation:access(conf)
     -- veredicto negativo: tratarla como `invalid_attestation` le haría creer
     -- al cliente que SU dispositivo es el problema (no reintentable) cuando
     -- en realidad el problema es transitorio y del lado de la dependencia.
-    -- `reject()` (403) queda reservado al resto de los casos: token
-    -- rechazado, veredicto insuficiente, replay, credenciales del Gateway.
+    -- Tampoco lo es un defecto de nuestra propia configuración: expulsar al
+    -- cliente con un 403 por una credencial propia mal armada no le da al
+    -- operador ninguna señal de que el problema es suyo, no del cliente.
+    -- `reject()` (403) queda reservado al resto de los casos: token del
+    -- cliente rechazado, veredicto insuficiente, replay.
     if source_kind == "unavailable" then
       return errors.exit(errors.DEPENDENCY_UNAVAILABLE,
         "app-attestation: dependencia no disponible (" .. tostring(source_err) .. ")")
@@ -101,6 +104,12 @@ function AppAttestation:access(conf)
     if source_kind == "upstream_error" then
       return errors.exit(errors.DEPENDENCY_ERROR,
         "app-attestation: la dependencia respondió fuera de contrato ("
+          .. tostring(source_err) .. ")")
+    end
+
+    if source_kind == "gateway_fault" then
+      return errors.exit(errors.GATEWAY_FAULT,
+        "app-attestation: credenciales o configuracion propias invalidas ("
           .. tostring(source_err) .. ")")
     end
 

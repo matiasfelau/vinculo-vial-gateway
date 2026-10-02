@@ -125,9 +125,10 @@ describe("service account de Google", function()
 
       assert.is_nil(token)
       assert.equals("oauth_http_400", reason)
-      -- Un 4xx es un problema de la aserción o las credenciales del Gateway,
-      -- nunca "Google está caído": no cuenta como falla de dependencia.
-      assert.equals("rejected", kind)
+      -- Un 4xx acá es un problema de la aserción o las credenciales propias:
+      -- defecto del Gateway, nunca "Google está caído" ni algo atribuible
+      -- al cliente (este canje no lleva ningún dato suyo).
+      assert.equals("gateway_fault", kind)
     end)
 
     it("clasifica un 5xx de Google como falla de dependencia", function()

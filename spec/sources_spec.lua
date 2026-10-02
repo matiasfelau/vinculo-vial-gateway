@@ -25,12 +25,13 @@ describe("fuente google", function()
       assert.equals("playintegrity_token_rejected", reason)
       assert.equals("rejected", kind)
 
-      -- 401/403: nuestras credenciales. El cliente no puede hacer nada, pero
-      -- tampoco es "Google está caído".
+      -- 401/403: nuestro access token de OAuth es inválido. Defecto propio
+      -- del Gateway: ni "el cliente hizo algo mal" (403) ni "Google está
+      -- caído" (502/503).
       for _, status in ipairs({ 401, 403 }) do
         local _, unauthorized, unauthorized_kind = google.parse_response(status, "{}")
         assert.equals("playintegrity_unauthorized", unauthorized)
-        assert.equals("rejected", unauthorized_kind)
+        assert.equals("gateway_fault", unauthorized_kind)
       end
     end)
 
