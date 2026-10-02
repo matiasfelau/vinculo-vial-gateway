@@ -113,15 +113,22 @@ function M.build_assertion(account, now)
 end
 
 --- Interpreta la respuesta del endpoint de token. Pura, para poder testearla.
+--
+-- A diferencia de decodeIntegrityToken, acá no entra ningún dato del
+-- cliente: es un canje servidor-a-servidor entre el Gateway y Google. No
+-- existe un 4xx que le sea atribuible al cliente — cualquiera que no sea
+-- 5xx es, por descarte, la aserción o las credenciales propias mal
+-- armadas.
+--
 -- @return string access_token, number vida en segundos
 -- @return nil, string motivo del fallo, string clasificación del fallo
 --         ("upstream_error" si Google respondió 5xx o un cuerpo fuera de
---         contrato; "rejected" para cualquier otro caso, el default seguro)
+--         contrato; "gateway_fault" para cualquier otro caso)
 function M.parse_token_response(status, body)
   if status ~= 200 then
     -- El cuerpo del error de Google no contiene datos del usuario, pero sí
     -- puede traer detalles del service account: se reporta sólo el status.
-    local kind = status >= 500 and "upstream_error" or "rejected"
+    local kind = status >= 500 and "upstream_error" or "gateway_fault"
     return nil, "oauth_http_" .. tostring(status), kind
   end
 
@@ -174,14 +181,17 @@ function M.get_access_token(conf, timeout_ms)
     return cached
   end
 
+  -- No leer o no poder firmar con el service account propio es, por
+  -- definición, un defecto de nuestra configuración: nunca del cliente ni
+  -- de Google.
   local account, account_err = M.load_service_account(conf)
   if not account then
-    return nil, account_err, "rejected"
+    return nil, account_err, "gateway_fault"
   end
 
   local assertion, assertion_err = M.build_assertion(account, ngx.time())
   if not assertion then
-    return nil, assertion_err, "rejected"
+    return nil, assertion_err, "gateway_fault"
   end
 
   local client = http.new()

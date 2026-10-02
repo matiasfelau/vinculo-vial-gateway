@@ -46,6 +46,13 @@ describe("contrato de error del Gateway", function()
     assert.same({ error = "bad_gateway", reason = "dependency_error" }, body)
   end)
 
+  it("responde 500 internal_error ante credenciales propias inválidas", function()
+    local status, body = errors.build(errors.GATEWAY_FAULT)
+
+    assert.equals(500, status)
+    assert.same({ error = "internal_error", reason = "gateway_fault" }, body)
+  end)
+
   it("no expone el motivo interno del rechazo", function()
     local _, body = errors.build(errors.INVALID_ATTESTATION)
 

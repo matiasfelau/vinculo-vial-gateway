@@ -35,6 +35,10 @@ REQUIRED_VARS=(
   SIGNIN_MAX_BODY_KB
   JWT_ISSUER
   JWT_PUBLIC_KEY
+  UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS
+  UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS
+  UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD
+  UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD
 )
 
 missing=()
@@ -51,8 +55,33 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
+# La plantilla referencia protocolo/host:puerto de cada upstream por separado
+# (el Service necesita protocolo y puerto; el target de su Upstream necesita
+# host:puerto), pero quien despliega sigue configurando una sola URL completa
+# por servicio (*_SERVICE_URL, como siempre): se derivan acá para no pedirle
+# que mantenga la misma información sincronizada en dos variables.
+derive_url_parts() {
+  local url="$1" prefix="$2"
+
+  export "${prefix}_PROTOCOL=${url%%://*}"
+  export "${prefix}_TARGET=${url#*://}"
+  export "${prefix}_PORT=${url##*:}"
+}
+
+derive_url_parts "${IDENTITY_SERVICE_URL}" IDENTITY_SERVICE
+derive_url_parts "${VEHICLE_SERVICE_URL}" VEHICLE_SERVICE
+derive_url_parts "${ALERT_SERVICE_URL}" ALERT_SERVICE
+derive_url_parts "${NOTIFICATION_SERVICE_URL}" NOTIFICATION_SERVICE
+
+DERIVED_VARS=(
+  IDENTITY_SERVICE_PROTOCOL IDENTITY_SERVICE_TARGET IDENTITY_SERVICE_PORT
+  VEHICLE_SERVICE_PROTOCOL VEHICLE_SERVICE_TARGET VEHICLE_SERVICE_PORT
+  ALERT_SERVICE_PROTOCOL ALERT_SERVICE_TARGET ALERT_SERVICE_PORT
+  NOTIFICATION_SERVICE_PROTOCOL NOTIFICATION_SERVICE_TARGET NOTIFICATION_SERVICE_PORT
+)
+
 substitutions=""
-for var in "${REQUIRED_VARS[@]}"; do
+for var in "${REQUIRED_VARS[@]}" "${DERIVED_VARS[@]}"; do
   substitutions+="\${${var}} "
 done
 

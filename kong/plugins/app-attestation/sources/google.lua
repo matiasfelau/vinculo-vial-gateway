@@ -17,21 +17,31 @@ local M = {}
 -- @return table `tokenPayloadExternal`
 -- @return nil, string motivo interno del rechazo, string clasificación del
 --         fallo ("upstream_error" si Google respondió 5xx o un cuerpo fuera
---         de contrato; "rejected" para un token inválido o un problema de
---         credenciales del Gateway — ninguno de los dos es "Google caído")
+--         de contrato; "rejected" para un token de cliente inválido;
+--         "gateway_fault" para un problema de credenciales o configuración
+--         propias — ninguno de los tres es "Google caído")
 function M.parse_response(status, body)
   if status == 400 then
-    -- Google rechaza el token: manipulado, de otra app, o ya expirado.
+    -- Google rechaza el TOKEN DEL CLIENTE: manipulado, de otra app, o ya
+    -- expirado. Responsabilidad del cliente, no nuestra.
     return nil, "playintegrity_token_rejected", "rejected"
   end
 
   if status == 401 or status == 403 then
-    -- Problema de credenciales del Gateway, no del cliente.
-    return nil, "playintegrity_unauthorized", "rejected"
+    -- Nuestro access token de OAuth es inválido: defecto propio del
+    -- Gateway. No es "Google caído" (502/503) ni "token del cliente
+    -- rechazado" (403 invalid_attestation) — tratarlo como cualquiera de
+    -- los dos oculta un error de configuración detrás de una respuesta que
+    -- sugiere que el problema es ajeno.
+    return nil, "playintegrity_unauthorized", "gateway_fault"
   end
 
   if status ~= 200 then
-    local kind = status >= 500 and "upstream_error" or "rejected"
+    -- Cualquier otro código no documentado por esta API: un 5xx es la
+    -- dependencia fallando; cualquier otro 4xx es, por descarte, algo mal
+    -- armado de nuestro lado — no hay otro 4xx que Google documente como
+    -- atribuible al cliente.
+    local kind = status >= 500 and "upstream_error" or "gateway_fault"
     return nil, "playintegrity_http_" .. tostring(status), kind
   end
 
