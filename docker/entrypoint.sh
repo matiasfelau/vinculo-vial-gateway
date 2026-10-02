@@ -36,6 +36,7 @@ REQUIRED_VARS=(
   JWT_ISSUER
   JWT_PUBLIC_KEY
   UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS
+  UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS
   UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS
   UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD
   UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD
@@ -52,6 +53,16 @@ if (( ${#missing[@]} > 0 )); then
   # Se listan los nombres, nunca los valores.
   echo "FATAL: faltan variables de entorno requeridas: ${missing[*]}" >&2
   echo "       Copiar .env.example a .env y completarlo." >&2
+  exit 1
+fi
+
+# Con un intervalo de 0 Kong no vuelve a sondear un target marcado no sano:
+# un corte breve de su base lo dejaría fuera del balanceo para siempre. Es el
+# único valor de healthcheck cuyo error no se nota hasta que ocurre la caída,
+# así que se rechaza en el arranque.
+if ! [[ "${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FATAL: UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS debe ser un entero positivo" >&2
+  echo "       (con 0 un target no sano no vuelve a sondearse y no se recupera)." >&2
   exit 1
 fi
 

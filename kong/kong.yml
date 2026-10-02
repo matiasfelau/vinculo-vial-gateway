@@ -26,10 +26,14 @@ _transform: true
 # fuera del balanceo → se cae también signin).
 #
 # Kong no tiene un "tiempo de apertura" separado como otros circuit breakers:
-# un target marcado no sano se vuelve a probar al mismo intervalo del
-# healthcheck activo, y recién vuelve a sano tras acumular
-# UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD éxitos consecutivos. La duración de
-# apertura es ese intervalo multiplicado por ese umbral, no un valor propio.
+# un target marcado no sano se vuelve a probar cada
+# UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS (`unhealthy.interval`), y recién
+# vuelve a sano tras acumular UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD éxitos
+# consecutivos. La duración de apertura es ese intervalo multiplicado por ese
+# umbral, no un valor propio. Ese intervalo nunca puede ser 0 (el entrypoint
+# lo rechaza): sin sondeo, un target marcado por el activo o por el pasivo no
+# vuelve jamás. `healthy.interval` (UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS)
+# es independiente: rige el sondeo de los targets sanos.
 upstreams:
   - name: identity-upstream
     targets:
@@ -40,7 +44,7 @@ upstreams:
         http_path: /ready
         timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
         healthy:
-          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
           successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
           http_statuses: [200]
         unhealthy:
@@ -69,7 +73,7 @@ upstreams:
         http_path: /ready
         timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
         healthy:
-          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
           successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
           http_statuses: [200]
         unhealthy:
@@ -98,7 +102,7 @@ upstreams:
         http_path: /ready
         timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
         healthy:
-          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
           successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
           http_statuses: [200]
         unhealthy:
@@ -127,7 +131,7 @@ upstreams:
         http_path: /ready
         timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
         healthy:
-          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
           successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
           http_statuses: [200]
         unhealthy:
