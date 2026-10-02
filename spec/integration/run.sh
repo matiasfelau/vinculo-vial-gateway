@@ -1181,7 +1181,7 @@ resilience_delete_status() {
 }
 
 flaky_control() {
-  docker exec "${FLAKY_UPSTREAM}" curl -s -o /dev/null "http://127.0.0.1:8080/control?$1"
+  docker exec "${GATEWAY}" curl -s -o /dev/null "http://${FLAKY_UPSTREAM}:8080/control?$1"
 }
 
 flaky_invocations() {
@@ -1196,13 +1196,13 @@ echo "Presupuesto agregado de Google (OAuth + decodeIntegrityToken)"
 # segunda llamada recibe los 1500ms que quedan, no una ventana nueva de 3000
 # (que daría ~5500ms). El piso de 3.8s verifica además que la demora del
 # stub se aplicó: sin ella, Play Integrity cortaría solo a los 3000ms.
-docker exec "${STUB}" curl -s -o /dev/null "http://127.0.0.1:8080/control/token-delay?ms=2500"
+docker exec "${GATEWAY}" curl -s -o /dev/null "http://${STUB}:8080/control/token-delay?ms=2500"
 
 budget_out="$(resilience_signup_timed SLOW)"
 budget_body="${budget_out%$'\n'*}"
 read -r budget_status budget_secs <<< "${budget_out##*$'\n'}"
 
-docker exec "${STUB}" curl -s -o /dev/null "http://127.0.0.1:8080/control/token-delay?ms=0"
+docker exec "${GATEWAY}" curl -s -o /dev/null "http://${STUB}:8080/control/token-delay?ms=0"
 
 check "un canje de OAuth lento y un decodeIntegrityToken colgado se traducen en 503" \
   503 "${budget_status}"
