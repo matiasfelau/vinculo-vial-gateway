@@ -1341,7 +1341,9 @@ echo "Recuperación: targets marcados por el healthcheck pasivo (timeouts y erro
 # distinguir quién lo sacó del balanceo. Así sólo el pasivo puede hacerlo, y
 # el activo (unhealthy.interval, 1s) queda como único camino de regreso. Que
 # la primera request llegue al upstream aunque /ready ya esté no sano es la
-# verificación de ese aislamiento.
+# verificación de ese aislamiento. Fuera de la suite ese 0 no está permitido:
+# el Gateway sólo lo acepta con GATEWAY_TEST_MODE=true (ver la guardia de
+# arranque, más abajo).
 echo "==> Levantando un upstream con el puerto cerrado"
 docker run -d --name "${LATE_UPSTREAM}" --network "${NETWORK}" \
   -v "$(to_host_path "${SCRIPT_DIR}/flaky-upstream/nginx.conf"):/conf/nginx.conf:ro" \
@@ -1365,6 +1367,7 @@ docker run -d --name "${GATEWAY_PASSIVE}" --network "${NETWORK}" \
   -e "JWT_ISSUER=${JWT_ISSUER}" \
   -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=1 \
   -e UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 \
+  -e GATEWAY_TEST_MODE=true \
   -e UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS=1 \
   -e UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD=1 \
   -e UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD=2 \
@@ -1468,7 +1471,7 @@ check "al empezar a escuchar el puerto, el target marcado por errores de conexi�
   200 "${passive_tcp_recovered}"
 
 echo
-echo "Guardia de arranque: el intervalo de sondeo de targets no sanos no puede ser 0"
+echo "Guardia de arranque: los intervalos de sondeo no pueden ser 0"
 
 guard_output="$(docker run --rm \
   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
@@ -1477,6 +1480,21 @@ guard_output="$(docker run --rm \
 
 check_contains "con UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=0 el Gateway no arranca" \
   "UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS debe ser un entero positivo" "${guard_output}"
+
+# Con 0 en el intervalo de targets sanos, el activo no los sondea y un
+# servicio con la base caída que sigue respondiendo 503 nunca saldría del
+# balanceo. Sólo se permite declarando el modo test, que la suite usa para
+# aislar el pasivo (cuarto Gateway, más arriba).
+healthy_guard_output="$(docker run --rm \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 \
+  vinculo-vial-gateway:integration 2>&1 || true)"
+
+check_contains "con UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 el Gateway no arranca" \
+  "UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS debe ser mayor que 0" "${healthy_guard_output}"
+
+check_contains "con GATEWAY_TEST_MODE=true el Gateway acepta ese 0 y lo avisa por WARN" \
+  "WARN: GATEWAY_TEST_MODE=true" "$(docker logs "${GATEWAY_PASSIVE}" 2>&1)"
 
 echo
 if (( failures > 0 )); then

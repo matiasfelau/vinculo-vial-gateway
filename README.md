@@ -54,7 +54,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 121 de integración | ✅ |
+| CI: 104 tests unitarios + 123 de integración | ✅ |
 
 ## Estructura
 
@@ -780,10 +780,14 @@ intervalo) tiene que ser un entero positivo y el Gateway no arranca con otro
 valor.
 
 `UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS` rige, en cambio, el sondeo de
-los targets sanos (`healthy.interval`). Con `0` ese sondeo se apaga y la
-salida del balanceo depende sólo del pasivo; la recuperación sigue siendo por
-el activo. La suite lo usa así para aislar los casos del pasivo; el valor por
-defecto (10) deja ambos sondeos encendidos.
+los targets sanos (`healthy.interval`), y también tiene que ser mayor que 0:
+con `0` el activo no los sondea y un servicio con su base caída que sigue
+respondiendo `503` nunca saldría del balanceo, lo opuesto al contrato (la
+salud la decide `/ready`). El Gateway tampoco arranca con ese valor, salvo que
+se declare `GATEWAY_TEST_MODE=true` (y entonces lo avisa por WARN). Sólo la
+suite de integración usa ese modo: pone el intervalo en `0` para que el activo
+no marque el target antes que el pasivo y así poder aislar los casos del
+pasivo; la recuperación sigue siendo por el activo.
 
 ## Convenciones
 
