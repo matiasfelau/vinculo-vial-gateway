@@ -33,7 +33,9 @@ _transform: true
 # umbral, no un valor propio. Ese intervalo nunca puede ser 0 (el entrypoint
 # lo rechaza): sin sondeo, un target marcado por el activo o por el pasivo no
 # vuelve jamás. `healthy.interval` (UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS)
-# es independiente: rige el sondeo de los targets sanos.
+# es independiente: rige el sondeo de los targets sanos, y tampoco puede ser 0
+# fuera de GATEWAY_TEST_MODE: sin sondearlos, un servicio con su base caída que
+# responde 503 nunca saldría del balanceo, y la salud la decide /ready.
 upstreams:
   - name: identity-upstream
     targets:

@@ -66,6 +66,26 @@ if ! [[ "${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# Con 0 en el intervalo de targets SANOS el activo no los sondea: un servicio
+# con la base caída que sigue respondiendo 503 nunca saldría del balanceo, lo
+# opuesto al contrato (la salud la decide /ready). Sólo la suite de integración
+# lo necesita en 0, para aislar el healthcheck pasivo, y lo declara con
+# GATEWAY_TEST_MODE=true; en cualquier otro caso se rechaza en el arranque.
+if ! [[ "${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "FATAL: UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS debe ser un entero" >&2
+  exit 1
+fi
+
+if [[ "${GATEWAY_TEST_MODE:-}" == "true" ]]; then
+  echo "WARN: GATEWAY_TEST_MODE=true. Se permite UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0." >&2
+  echo "      No usar fuera de la suite de integración." >&2
+elif [[ "${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}" == "0" ]]; then
+  echo "FATAL: UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS debe ser mayor que 0" >&2
+  echo "       (con 0 el healthcheck activo no sondea targets sanos y un servicio con" >&2
+  echo "       su base caída que responde 503 nunca sale del balanceo)." >&2
+  exit 1
+fi
+
 # La plantilla referencia protocolo/host:puerto de cada upstream por separado
 # (el Service necesita protocolo y puerto; el target de su Upstream necesita
 # host:puerto), pero quien despliega sigue configurando una sola URL completa
