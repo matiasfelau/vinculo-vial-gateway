@@ -288,6 +288,39 @@ route_headers() {
   fi
 }
 
+# Manda un body de `bytes` bytes aleatorios (octet-stream) y devuelve el status
+# HTTP. El archivo se arma y se referencia dentro del contenedor, con un único
+# `sh -c`, para no chocar con el límite de argumentos del shell del host ni con
+# la conversión de rutas de Git Bash sobre `@/tmp/...`. El `; true` evita que
+# `set -e` aborte la suite si curl corta la subida ante un 413 temprano.
+sized_status() {
+  local method="$1" path="$2" token="$3" bytes="$4"
+
+  docker exec "${GATEWAY}" sh -c "
+    head -c ${bytes} /dev/urandom > /tmp/sized.bin
+    curl -s -o /dev/null -w '%{http_code}' -X ${method} 'http://127.0.0.1:8000${path}' \
+      -H 'Authorization: Bearer ${token}' \
+      -H 'Content-Type: application/octet-stream' -H 'Expect:' \
+      --data-binary @/tmp/sized.bin
+    true"
+}
+
+# Igual que `sized_status`, pero como el multipart de `POST /api/v1/alerts`
+# (US-08): una parte `metadata` JSON y una parte `general` de `bytes` bytes. El
+# Gateway no inspecciona ni valida el contenido: sólo cuenta el tamaño.
+multipart_status() {
+  local token="$1" bytes="$2"
+
+  docker exec "${GATEWAY}" sh -c "
+    printf '%s' '{\"attempt_id\":\"0f1e2d3c-4b5a-4968-8776-655443322110\",\"alert_type\":\"CRASHED\"}' > /tmp/meta.json
+    head -c ${bytes} /dev/urandom > /tmp/part.bin
+    curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/api/v1/alerts \
+      -H 'Authorization: Bearer ${token}' -H 'Expect:' \
+      -F 'metadata=@/tmp/meta.json;type=application/json' \
+      -F 'general=@/tmp/part.bin;type=application/octet-stream'
+    true"
+}
+
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
 # el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
 # service account de Google — no una reimplementación paralela del firmado.
@@ -870,12 +903,10 @@ check_contains "POST /api/v1/alerts lo atiende alerts-route (5/min, 10/h)" \
 
 check "POST /api/v1/alerts/ (barra final) ya no matchea alerts-route" \
   404 "$(route_status POST /api/v1/alerts/ "${exact_token}")"
-check "POST /api/v1/alerts/attempts no cae en alerts-route" \
-  404 "$(route_status POST /api/v1/alerts/attempts "${exact_token}")"
-check "POST /api/v1/alerts/{uuid}/report no cae en alerts-route" \
-  404 "$(route_status POST "/api/v1/alerts/${exact_uuid}/report" "${exact_token}")"
-check "PUT /api/v1/alerts/{uuid}/feedback no cae en alerts-route" \
-  404 "$(route_status PUT "/api/v1/alerts/${exact_uuid}/feedback" "${exact_token}")"
+check "POST /api/v1/alerts/{subrecurso} inexistente no cae en alerts-route" \
+  404 "$(route_status POST /api/v1/alerts/inexistente "${exact_token}")"
+check "POST /api/v1/alerts/{uuid} no cae en alerts-route" \
+  404 "$(route_status POST "/api/v1/alerts/${exact_uuid}" "${exact_token}")"
 
 check "GET /api/v1/alerts/inbox sigue ruteando a alerts-inbox-route" \
   200 "$(route_status GET /api/v1/alerts/inbox "${exact_token}")"
@@ -886,6 +917,159 @@ check "POST /api/v1/vehicles/ (barra final) ya no matchea vehicles-route" \
   404 "$(route_status POST /api/v1/vehicles/ "${exact_token}")"
 check "POST /api/v1/vehicles/check (eliminado en US-08) ya no tiene Route" \
   404 "$(route_status POST /api/v1/vehicles/check "${exact_token}")"
+
+echo
+echo "Rutas de US-08: matriz de ruteo"
+
+# Cada Route nueva declara un `rate-limiting` propio, y Kong expone su límite
+# en `X-RateLimit-Limit-*`: es lo que identifica QUÉ Route atendió.
+u8_user="3a4b5c6d-7e8f-4a9b-8c0d-1e2f3a4b5c6d"
+u8_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_user}\",\"exp\":$((now + 300))}")"
+u8_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+u8_evidence="/api/v1/alerts/${u8_uuid}/evidence"
+u8_feedback="/api/v1/alerts/${u8_uuid}/feedback"
+u8_report="/api/v1/alerts/${u8_uuid}/report"
+
+attempts_headers="$(route_headers POST /api/v1/alerts/attempts "${u8_token}")"
+check_contains "POST /api/v1/alerts/attempts → alerts-attempts-route (10/min)" \
+  "x-ratelimit-limit-minute: 10" "${attempts_headers}"
+check_contains "POST /api/v1/alerts/attempts → alerts-attempts-route (30/h)" \
+  "x-ratelimit-limit-hour: 30" "${attempts_headers}"
+
+check "GET /api/v1/alerts/{uuid}/evidence/PLATE/0 → alerts-evidence-route" \
+  200 "$(route_status GET "${u8_evidence}/PLATE/0" "${u8_token}")"
+for role in GENERAL PLATE DETAIL CONTEXT; do
+  check "GET .../evidence/${role}/2 rutea" \
+    200 "$(route_status GET "${u8_evidence}/${role}/2" "${u8_token}")"
+done
+check "GET .../evidence/FOO/0 (rol fuera del catálogo) → 404" \
+  404 "$(route_status GET "${u8_evidence}/FOO/0" "${u8_token}")"
+check "GET .../evidence/plate/0 (rol en minúsculas) → 404" \
+  404 "$(route_status GET "${u8_evidence}/plate/0" "${u8_token}")"
+check "GET .../evidence/PLATE/10 (índice de dos dígitos) → 404" \
+  404 "$(route_status GET "${u8_evidence}/PLATE/10" "${u8_token}")"
+check "GET .../evidence/PLATE/0/extra → 404" \
+  404 "$(route_status GET "${u8_evidence}/PLATE/0/extra" "${u8_token}")"
+check "GET /api/v1/alerts/{id corto}/evidence/PLATE/0 → 404" \
+  404 "$(route_status GET /api/v1/alerts/1234/evidence/PLATE/0 "${u8_token}")"
+check "POST .../evidence/PLATE/0 (método incorrecto) → 404" \
+  404 "$(route_status POST "${u8_evidence}/PLATE/0" "${u8_token}")"
+
+check_contains "PUT .../feedback → alerts-feedback-route (30/min)" \
+  "x-ratelimit-limit-minute: 30" "$(route_headers PUT "${u8_feedback}" "${u8_token}")"
+check "POST .../feedback (método incorrecto) → 404" \
+  404 "$(route_status POST "${u8_feedback}" "${u8_token}")"
+check "PUT /api/v1/alerts/{id corto}/feedback → 404" \
+  404 "$(route_status PUT /api/v1/alerts/1234/feedback "${u8_token}")"
+
+report_headers="$(route_headers POST "${u8_report}" "${u8_token}")"
+check_contains "POST .../report → alerts-report-route (5/min)" \
+  "x-ratelimit-limit-minute: 5" "${report_headers}"
+check_contains "POST .../report → alerts-report-route (20/h)" \
+  "x-ratelimit-limit-hour: 20" "${report_headers}"
+check "PUT .../report (método incorrecto) → 404" \
+  404 "$(route_status PUT "${u8_report}" "${u8_token}")"
+check "POST .../report/ (barra final) → 404" \
+  404 "$(route_status POST "${u8_report}/" "${u8_token}")"
+
+check "POST /api/v1/alerts sigue en alerts-route" \
+  200 "$(route_status POST /api/v1/alerts "${u8_token}")"
+check "GET /api/v1/alerts/inbox sigue en alerts-inbox-route" \
+  200 "$(route_status GET /api/v1/alerts/inbox "${u8_token}")"
+check "POST /api/v1/vehicles sigue en vehicles-route" \
+  200 "$(route_status POST /api/v1/vehicles "${u8_token}")"
+check "POST /api/v1/vehicles/check → 404" \
+  404 "$(route_status POST /api/v1/vehicles/check "${u8_token}")"
+
+echo
+echo "Rutas de US-08: seguridad (JWT y Token Offloading)"
+
+u8_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_user}\",\"exp\":$((now - 300))}")"
+for target in "POST /api/v1/alerts/attempts" "GET ${u8_evidence}/PLATE/0" \
+  "PUT ${u8_feedback}" "POST ${u8_report}"; do
+  method="${target%% *}"; path="${target#* }"
+
+  check "sin Authorization, 401: ${method} ${path##*/}" \
+    401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H 'Content-Type: application/json' -d '{}')"
+  check "JWT expirado, 401: ${method} ${path##*/}" \
+    401 "$(route_status "${method}" "${path}" "${u8_expired}")"
+
+  spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u8_token}" \
+    -H 'X-User-Id: usuario-suplantado' \
+    -H 'Content-Type: application/json' -d '{}' | tr '[:upper:]' '[:lower:]')"
+  check_contains "X-User-Id del JWT llega al upstream: ${method} ${path##*/}" \
+    "\"x-user-id\": \"${u8_user}\"" "${spoofed_view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${method} ${path##*/}" \
+    "usuario-suplantado" "${spoofed_view}"
+  check_not_contains "el Authorization no se propaga: ${method} ${path##*/}" \
+    "authorization" "${spoofed_view}"
+done
+
+echo
+echo "Rutas de US-08: límites de tamaño"
+
+u8_size_user="5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f"
+u8_size_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_size_user}\",\"exp\":$((now + 300))}")"
+
+# `alerts-route`: 5 MB = 5242880 bytes. 5,1 MB (5347738) se rechaza; 4,8 MB
+# (5033165) pasa. El 413 de Kong no gasta cupo de rate limit.
+check "multipart de 5,1 MB → 413" \
+  413 "$(multipart_status "${u8_size_token}" 5347738)"
+check "multipart de 4,8 MB pasa" \
+  200 "$(multipart_status "${u8_size_token}" 5033165)"
+
+check "attempts de 9000 bytes (> 8 KB) → 413" \
+  413 "$(sized_status POST /api/v1/alerts/attempts "${u8_size_token}" 9000)"
+check "attempts de 7000 bytes (≤ 8 KB) pasa" \
+  200 "$(sized_status POST /api/v1/alerts/attempts "${u8_size_token}" 7000)"
+check "feedback de 1500 bytes (> 1 KB) → 413" \
+  413 "$(sized_status PUT "${u8_feedback}" "${u8_size_token}" 1500)"
+check "feedback de 900 bytes (≤ 1 KB) pasa" \
+  200 "$(sized_status PUT "${u8_feedback}" "${u8_size_token}" 900)"
+check "report de 1500 bytes (> 1 KB) → 413" \
+  413 "$(sized_status POST "${u8_report}" "${u8_size_token}" 1500)"
+check "report de 900 bytes (≤ 1 KB) pasa" \
+  200 "$(sized_status POST "${u8_report}" "${u8_size_token}" 900)"
+
+echo
+echo "Rutas de US-08: rate limiting por X-User-Id"
+
+# Mismo guard de reloj que el de /alerts/inbox: el contador `local` usa una
+# ventana fija alineada al minuto de reloj; si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado.
+u8_rl_seconds="$(date +%S)"; u8_rl_seconds=$((10#${u8_rl_seconds}))
+if (( u8_rl_seconds > 30 )); then
+  u8_rl_sleep=$((60 - u8_rl_seconds))
+  echo "  (esperando ${u8_rl_sleep}s al próximo minuto de reloj, para no cruzar la ventana del rate-limiting a mitad de la ráfaga)"
+  sleep "${u8_rl_sleep}"
+fi
+
+u8_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d\",\"exp\":$((now + 300))}")"
+u8_rl_other="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"8b9c0d1e-2f3a-4b4c-9d5e-6f7a8b9c0d1e\",\"exp\":$((now + 300))}")"
+
+for _ in $(seq 1 9); do
+  route_status POST /api/v1/alerts/attempts "${u8_rl_token}" >/dev/null
+done
+check "el attempt 10 del minuto todavía pasa" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_token}")"
+check "el attempt 11 del minuto → 429" \
+  429 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_token}")"
+check "otro usuario no comparte el contador de attempts" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_other}")"
+
+for _ in $(seq 1 4); do
+  route_status POST "${u8_report}" "${u8_rl_token}" >/dev/null
+done
+check "el report 5 del minuto todavía pasa" \
+  200 "$(route_status POST "${u8_report}" "${u8_rl_token}")"
+check "el report 6 del minuto → 429" \
+  429 "$(route_status POST "${u8_report}" "${u8_rl_token}")"
+check "otro usuario no comparte el contador de report" \
+  200 "$(route_status POST "${u8_report}" "${u8_rl_other}")"
 
 echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
