@@ -482,10 +482,9 @@ paginación.
 
 ### Precedencia frente a `POST /alerts`
 
-Ambas Routes comparten el prefijo `/api/v1/alerts`, pero Kong resuelve por
-método además de por path: `alerts-route` declara `methods: [POST]` de forma
-explícita, así que un `GET` nunca puede matchearla, sin importar la
-especificidad del path. Verificado en la suite de integración con una
+Ambas Routes comparten el prefijo `/api/v1/alerts`, pero `alerts-route` es de
+path exacto (US-08) y además declara `methods: [POST]` de forma explícita, así
+que un `GET` nunca puede matchearla. Verificado en la suite de integración con una
 secuencia de 20 requests exitosos a `/alerts/inbox` seguidos de un 21° que
 recibe `429` — si el `GET` hubiera caído por error en `alerts-route`, esa
 secuencia habría fallado mucho antes del vigésimo request, contra el límite de
@@ -497,6 +496,39 @@ El DTO de salida (`id`, `alert_type`, `created_at`) es responsabilidad
 exclusiva de Alert; el Gateway no inspecciona el body de la respuesta, sólo la
 perimetra. La regla de anonimato del emisor —nunca `issuer_id`, `owner_id` ni
 la patente hacia el cliente— vive en el contrato compartido, no en este repo.
+
+## Intento, evidencia, feedback y reporte: `/alerts/...` (US-08)
+
+Cuatro Routes nuevas sobre `alert-service` (sus timeouts no cambian), más
+límite de tamaño en `POST /alerts`. Mismo perímetro base que `/alerts`: `jwt` +
+`token-offloading` (`X-User-Id`), sin `app-attestation` (fuera de alcance de
+US-08).
+
+| Route | Método y path | Límite por usuario | Tamaño máximo |
+|---|---|---|---|
+| `alerts-route` | `POST /api/v1/alerts` (multipart) | 5/min, 10/h | 5 MB |
+| `alerts-attempts-route` | `POST /api/v1/alerts/attempts` | 10/min, 30/h | 8 KB |
+| `alerts-evidence-route` | `GET /api/v1/alerts/{uuid}/evidence/{GENERAL\|PLATE\|DETAIL\|CONTEXT}/{0-9}` | 60/min | — |
+| `alerts-feedback-route` | `PUT /api/v1/alerts/{uuid}/feedback` | 30/min | 1 KB |
+| `alerts-report-route` | `POST /api/v1/alerts/{uuid}/report` | 5/min, 20/h | 1 KB |
+
+- **Paths exactos.** Toda Route que comparte el prefijo `/api/v1/alerts` se
+  declara con regex anclada (`~...$`): ningún prefijo captura el subrecurso de
+  otro endpoint. `vehicles-route` también es exacta, así que el viejo
+  `POST /api/v1/vehicles/check` (eliminado: el check lo hace Alert con el
+  intento) responde `404` de Kong.
+- **Tamaño.** Cada Route con body lleva su propio `request-size-limiting`; el
+  techo global de nginx (`5m`) no lo reemplaza. El multipart de `POST /alerts`
+  queda en memoria (`client_body_buffer_size = 5m`) y el Gateway sólo lo
+  reenvía, sin inspeccionarlo ni bufferizarlo a disco. El límite corre antes
+  que `rate-limiting`, así que un `413` no gasta cupo.
+- **Rate limit por `X-User-Id`.** `attempts` es un oráculo de pertenencia de
+  patentes y `report` puede poner a un emisor en revisión: de ahí los límites
+  estrictos. Cada Route tiene contador propio y dos usuarios nunca lo
+  comparten.
+- **Diferencia conocida con el contrato.** Ante un timeout del upstream Kong
+  responde `504`, mientras que el contrato de US-08 usa `503` para las
+  dependencias caídas. No se reescribe en el Gateway.
 
 ## Registro y Baja de Tokens FCM: `/notifications/tokens` (US-06)
 

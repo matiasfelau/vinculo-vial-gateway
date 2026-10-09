@@ -564,6 +564,17 @@ services:
           # cualquiera con un JWT válido podría barrer el endpoint. El
           # cupo es independiente por `X-User-Id` — dos usuarios distintos
           # nunca comparten contador.
+          # Multipart de la llamada 2 (metadata + fotos HPKE): cada parte es
+          # ≤ 1 MiB y el body completo entra en 5 MB. Con
+          # `client_body_buffer_size` en 5m (kong.conf) nginx lo mantiene en
+          # memoria, y el Gateway sólo lo reenvía, sin inspeccionarlo. Es el
+          # límite propio de la Route: el techo global de nginx no lo
+          # reemplaza.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 5
+              size_unit: megabytes
+              require_content_length: false
           - name: rate-limiting
             config:
               minute: 5
@@ -620,6 +631,180 @@ services:
           - name: rate-limiting
             config:
               minute: 20
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # US-08 — Intento, evidencia, feedback y reporte. Todas cuelgan de
+      # `alert-service` (timeouts sin cambios) y comparten el prefijo
+      # `/api/v1/alerts` con `alerts-route`, así que cada una declara un
+      # path exacto (regex anclada con `$`): ningún prefijo puede capturar
+      # el subrecurso de otro endpoint. Mismo par jwt + token-offloading que
+      # `alerts-route` (sin `app-attestation`, fuera de alcance de US-08);
+      # `token-offloading` corre en PRIORITY 1000, antes que `rate-limiting`
+      # (910), para que `X-User-Id` exista cuando éste lee `limit_by: header`.
+      # `request-size-limiting` (951) corre antes que `rate-limiting`: un body
+      # fuera de tope se rechaza con 413 sin gastar cupo.
+      #
+      # Ante un timeout del upstream Kong responde 504, mientras que el
+      # contrato de US-08 usa 503 para las dependencias caídas. Es una
+      # diferencia conocida y aceptada: no se reescribe en el Gateway.
+
+      # Llamada 1: el intento. Responde si el vehículo está en la red, así
+      # que es un oráculo de pertenencia de patentes: de ahí el rate limit
+      # por `X-User-Id`. El body es `{ "pat_enc": "<base64>" }`.
+      - name: alerts-attempts-route
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/alerts/attempts$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 8
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 10
+              hour: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Evidencia redactada para el dueño de la alerta. Lectura: el Gateway
+      # sólo reenvía la imagen que devuelve Alert, sin inspeccionarla ni
+      # transformarla. Los roles e índices válidos se acotan en el path.
+      - name: alerts-evidence-route
+        methods:
+          - GET
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/evidence/(GENERAL|PLATE|DETAIL|CONTEXT)/[0-9]$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 60
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Valoración (👍/👎) de la validación. Body: `{ "rating": "UP|DOWN" }`.
+      - name: alerts-feedback-route
+        methods:
+          - PUT
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/feedback$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Reporte del emisor por el dueño. Cada reporte puede poner al emisor
+      # en revisión, así que el límite es estricto. Body:
+      # `{ "reason": "FALSE_ALERT|SPAM" }`.
+      - name: alerts-report-route
+        methods:
+          - POST
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/report$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 5
+              hour: 20
               limit_by: header
               header_name: X-User-Id
               policy: local
