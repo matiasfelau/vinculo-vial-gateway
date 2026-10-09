@@ -248,6 +248,46 @@ notifications_delete_status() {
   fi
 }
 
+# Manda `METHOD path` con el Bearer token dado y devuelve el status HTTP. US-08:
+# el upstream de eco responde 200 a cualquier path, así que un 404 sólo puede
+# ser de Kong (ninguna Route matcheó): es lo que distingue "ruteado" de "no
+# ruteado" en la matriz de ruteo.
+route_status() {
+  local method="$1" path="$2" token="$3"
+
+  if [[ "${method}" == "GET" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X GET "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary '{}'
+  fi
+}
+
+# Igual que `route_status`, pero devuelve los headers de la respuesta en
+# minúsculas. Sirve para identificar QUÉ Route atendió la request: cada una
+# declara un `rate-limiting` propio y Kong expone su límite en
+# `X-RateLimit-Limit-*` (`hide_client_headers: false`).
+route_headers() {
+  local method="$1" path="$2" token="$3"
+
+  if [[ "${method}" == "GET" ]]; then
+    docker exec "${GATEWAY}" curl -s -D - -o /dev/null \
+      -X GET "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" | tr '[:upper:]' '[:lower:]'
+  else
+    docker exec "${GATEWAY}" curl -s -D - -o /dev/null \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary '{}' | tr '[:upper:]' '[:lower:]'
+  fi
+}
+
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
 # el mismo módulo (`vv.jws`) que el plugin usa para firmar la aserción del
 # service account de Google — no una reimplementación paralela del firmado.
@@ -813,6 +853,39 @@ check "/internal/resolve-owner no tiene Route: 404" \
     -X POST http://127.0.0.1:8000/internal/resolve-owner \
     -H 'Content-Type: application/json' \
     -d '{"pat_enc":"cripto-para-vehicle"}')"
+
+echo
+echo "Ruteo exacto (US-08): alerts-route y vehicles-route no capturan subrecursos"
+
+# Usuario dedicado: el cupo de `alerts-route` (5/min) es por X-User-Id, y USER_SUB
+# ya consumió parte del suyo más arriba.
+exact_user="6d7e8f90-a1b2-4c3d-8e4f-5a6b7c8d9e0f"
+exact_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${exact_user}\",\"exp\":$((now + 300))}")"
+exact_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+
+check "POST /api/v1/alerts sigue ruteando a alerts-route" \
+  200 "$(route_status POST /api/v1/alerts "${exact_token}")"
+check_contains "POST /api/v1/alerts lo atiende alerts-route (5/min, 10/h)" \
+  "x-ratelimit-limit-hour: 10" "$(route_headers POST /api/v1/alerts "${exact_token}")"
+
+check "POST /api/v1/alerts/ (barra final) ya no matchea alerts-route" \
+  404 "$(route_status POST /api/v1/alerts/ "${exact_token}")"
+check "POST /api/v1/alerts/attempts no cae en alerts-route" \
+  404 "$(route_status POST /api/v1/alerts/attempts "${exact_token}")"
+check "POST /api/v1/alerts/{uuid}/report no cae en alerts-route" \
+  404 "$(route_status POST "/api/v1/alerts/${exact_uuid}/report" "${exact_token}")"
+check "PUT /api/v1/alerts/{uuid}/feedback no cae en alerts-route" \
+  404 "$(route_status PUT "/api/v1/alerts/${exact_uuid}/feedback" "${exact_token}")"
+
+check "GET /api/v1/alerts/inbox sigue ruteando a alerts-inbox-route" \
+  200 "$(route_status GET /api/v1/alerts/inbox "${exact_token}")"
+
+check "POST /api/v1/vehicles sigue ruteando a vehicles-route" \
+  200 "$(route_status POST /api/v1/vehicles "${exact_token}")"
+check "POST /api/v1/vehicles/ (barra final) ya no matchea vehicles-route" \
+  404 "$(route_status POST /api/v1/vehicles/ "${exact_token}")"
+check "POST /api/v1/vehicles/check (eliminado en US-08) ya no tiene Route" \
+  404 "$(route_status POST /api/v1/vehicles/check "${exact_token}")"
 
 echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
