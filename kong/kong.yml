@@ -813,6 +813,85 @@ services:
               error_code: 429
               error_message: "API rate limit exceeded"
 
+      # US-09 — Buzón de Enviados. Mismas reglas que las de US-08: comparten el
+      # prefijo `/api/v1/alerts` con `alerts-route`, así que declaran path
+      # exacto (regex anclada con `$`), y el mismo par jwt + token-offloading
+      # (PRIORITY 1000, antes que `rate-limiting`) para que `X-User-Id` exista
+      # cuando éste lee `limit_by: header`. Sin `app-attestation`, igual que el
+      # resto de las Routes de alertas.
+
+      # Lista de alertas del emisor. Lectura idempotente que sólo devuelve
+      # datos del usuario autenticado: mismo cupo que `alerts-inbox-route`. La
+      # paginación (`limit`/`cursor`) viaja en la query string y la valida
+      # Alert, no el Gateway.
+      - name: alerts-sent-route
+        methods:
+          - GET
+        paths:
+          - ~/api/v1/alerts/sent$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 20
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # El dueño marca la alerta como leída al abrir el chat. Idempotente y sin
+      # body (responde 204), así que no lleva `request-size-limiting`.
+      - name: alerts-seen-route
+        methods:
+          - PUT
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/seen$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
       # Igual que con Vehicle: no existe ninguna Route que matchee
       # `/internal/*`. `/internal/resolve-owner` (Alert → Vehicle) es
       # tráfico interno directo, nunca expuesto en Kong.

@@ -45,6 +45,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Rate limiting global | ✅ |
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
+| Ruteo y rate limiting por usuario en `/alerts/sent` (20/min) y `PUT /alerts/{uuid}/seen` (30/min), US-09 | ✅ |
 | Rate limiting por usuario en el alta de `/notifications/tokens` (10/día sobre `X-User-Id`) | ✅ |
 | La baja de `/notifications/tokens` sin rate limiting (deliberado, ver más abajo) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
@@ -529,6 +530,21 @@ US-08).
 - **Diferencia conocida con el contrato.** Ante un timeout del upstream Kong
   responde `504`, mientras que el contrato de US-08 usa `503` para las
   dependencias caídas. No se reescribe en el Gateway.
+
+## Buzón de Enviados: `/alerts/sent` y `/alerts/{uuid}/seen` (US-09)
+
+Dos Routes más sobre `alert-service`, con el mismo perímetro que
+`alerts-inbox-route`: `jwt` + `token-offloading` (`X-User-Id`) + `rate-limiting`
+por `X-User-Id`, sin `app-attestation`.
+
+| Route | Método y path | Límite por usuario |
+|---|---|---|
+| `alerts-sent-route` | `GET /api/v1/alerts/sent` (`limit`/`cursor` en la query) | 20/min |
+| `alerts-seen-route` | `PUT /api/v1/alerts/{uuid}/seen` | 30/min |
+
+Ambas son de path exacto (regex anclada), así que ni `alerts-route`
+(`~/api/v1/alerts$`) ni ninguna otra las captura, y ellas no capturan nada
+ajeno. `seen` no lleva `request-size-limiting`: no tiene body (responde `204`).
 
 ## Registro y Baja de Tokens FCM: `/notifications/tokens` (US-06)
 
