@@ -30,6 +30,9 @@ readonly FLAKY_UPSTREAM=vv-it-flaky-upstream
 # el pasivo.
 readonly GATEWAY_PASSIVE=vv-it-gateway-passive
 readonly LATE_UPSTREAM=vv-it-late-upstream
+# Quinto Gateway, con `KONG_TRUSTED_IPS` declarado, para simular el despliegue
+# detrás de Nginx Proxy Manager (ver "Rutas de US-09: detrás de un proxy").
+readonly GATEWAY_PROXY=vv-it-gateway-proxy
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 readonly JWT_ISSUER=vinculo-vial-identity
 
@@ -51,7 +54,7 @@ failures=0
 cleanup() {
   docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" \
     "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" "${GATEWAY_RESILIENCE}" "${FLAKY_UPSTREAM}" \
-    "${GATEWAY_PASSIVE}" "${LATE_UPSTREAM}" >/dev/null 2>&1 || true
+    "${GATEWAY_PASSIVE}" "${LATE_UPSTREAM}" "${GATEWAY_PROXY}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -1070,6 +1073,165 @@ check "el report 6 del minuto → 429" \
   429 "$(route_status POST "${u8_report}" "${u8_rl_token}")"
 check "otro usuario no comparte el contador de report" \
   200 "$(route_status POST "${u8_report}" "${u8_rl_other}")"
+
+echo
+echo "Rutas de US-09: matriz de ruteo (alerts-sent-route y alerts-seen-route)"
+
+# El upstream de eco responde 200 a todo (incluido el PUT .../seen, que en
+# Alert devuelve 204): acá sólo se verifica QUÉ Route atiende cada request, no
+# el status del servicio real.
+u9_user="2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
+u9_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u9_user}\",\"exp\":$((now + 300))}")"
+u9_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u9_user}\",\"exp\":$((now - 300))}")"
+u9_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+u9_sent="/api/v1/alerts/sent"
+u9_seen="/api/v1/alerts/${u9_uuid}/seen"
+
+check "GET /api/v1/alerts/sent → alerts-sent-route" \
+  200 "$(route_status GET "${u9_sent}" "${u9_token}")"
+check_contains "GET /api/v1/alerts/sent lo atiende alerts-sent-route (20/min)" \
+  "x-ratelimit-limit-minute: 20" "$(route_headers GET "${u9_sent}" "${u9_token}")"
+check "GET /api/v1/alerts/sent con limit y cursor rutea igual" \
+  200 "$(route_status GET "${u9_sent}?limit=50&cursor=abc" "${u9_token}")"
+check "POST /api/v1/alerts/sent (método incorrecto) → 404" \
+  404 "$(route_status POST "${u9_sent}" "${u9_token}")"
+check "GET /api/v1/alerts/sent/ (barra final) → 404" \
+  404 "$(route_status GET "${u9_sent}/" "${u9_token}")"
+check "GET /api/v1/alerts/sentinel (mismo prefijo) → 404" \
+  404 "$(route_status GET /api/v1/alerts/sentinel "${u9_token}")"
+check "GET /api/v1/alerts/sent/{uuid} → 404" \
+  404 "$(route_status GET "${u9_sent}/${u9_uuid}" "${u9_token}")"
+
+u9_seen_headers="$(route_headers PUT "${u9_seen}" "${u9_token}")"
+check "PUT /api/v1/alerts/{uuid}/seen → alerts-seen-route" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_token}")"
+check_contains "PUT .../seen lo atiende alerts-seen-route (30/min)" \
+  "x-ratelimit-limit-minute: 30" "${u9_seen_headers}"
+check "POST .../seen (método incorrecto) → 404" \
+  404 "$(route_status POST "${u9_seen}" "${u9_token}")"
+check "GET .../seen (método incorrecto) → 404" \
+  404 "$(route_status GET "${u9_seen}" "${u9_token}")"
+check "PUT /api/v1/alerts/{id corto}/seen → 404" \
+  404 "$(route_status PUT /api/v1/alerts/1234/seen "${u9_token}")"
+check "PUT .../seen/ (barra final) → 404" \
+  404 "$(route_status PUT "${u9_seen}/" "${u9_token}")"
+check "PUT .../seen/extra → 404" \
+  404 "$(route_status PUT "${u9_seen}/extra" "${u9_token}")"
+
+# Ninguna Route existente captura los paths nuevos, ni al revés: cada una sigue
+# atendiendo lo suyo.
+check_contains "POST /api/v1/alerts sigue en alerts-route (5/min, 10/h)" \
+  "x-ratelimit-limit-hour: 10" "$(route_headers POST /api/v1/alerts "${u9_token}")"
+check_contains "GET /api/v1/alerts/inbox sigue en alerts-inbox-route (20/min, sin hora)" \
+  "x-ratelimit-limit-minute: 20" "$(route_headers GET /api/v1/alerts/inbox "${u9_token}")"
+check "POST /api/v1/alerts/attempts sigue en alerts-attempts-route" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u9_token}")"
+check "PUT .../feedback sigue en alerts-feedback-route" \
+  200 "$(route_status PUT "/api/v1/alerts/${u9_uuid}/feedback" "${u9_token}")"
+check "POST .../report sigue en alerts-report-route" \
+  200 "$(route_status POST "/api/v1/alerts/${u9_uuid}/report" "${u9_token}")"
+
+echo
+echo "Rutas de US-09: seguridad (JWT y Token Offloading)"
+
+for target in "GET ${u9_sent}" "PUT ${u9_seen}"; do
+  method="${target%% *}"; path="${target#* }"
+
+  check "sin Authorization, 401: ${method} ${path##*/}" \
+    401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}")"
+  check "JWT expirado, 401: ${method} ${path##*/}" \
+    401 "$(route_status "${method}" "${path}" "${u9_expired}")"
+
+  u9_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u9_token}" \
+    -H 'X-User-Id: usuario-suplantado' | tr '[:upper:]' '[:lower:]')"
+  check_contains "X-User-Id del JWT llega al upstream: ${method} ${path##*/}" \
+    "\"x-user-id\": \"${u9_user}\"" "${u9_spoofed_view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${method} ${path##*/}" \
+    "usuario-suplantado" "${u9_spoofed_view}"
+  check_not_contains "el Authorization no se propaga: ${method} ${path##*/}" \
+    "authorization" "${u9_spoofed_view}"
+done
+
+echo
+echo "Rutas de US-09: rate limiting por X-User-Id (sent 20/min, seen 30/min)"
+
+# Mismo guard de reloj que el de /alerts/inbox: la ventana fija del contador
+# `local` se alinea al minuto de reloj y, si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado. Cada ráfaga espera por su
+# cuenta (`$1` = segundos máximos que puede pasar del minuto de reloj al
+# arrancar), porque juntas no entran en un mismo minuto.
+u9_wait_clock_minute() {
+  local now_seconds
+  now_seconds="$(date +%S)"; now_seconds=$((10#${now_seconds}))
+  if (( now_seconds > $1 )); then
+    echo "  (esperando $((60 - now_seconds))s al próximo minuto de reloj, para no cruzar la ventana del rate-limiting a mitad de la ráfaga)"
+    sleep $((60 - now_seconds))
+  fi
+}
+
+u9_wait_clock_minute 25
+
+u9_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a\",\"exp\":$((now + 300))}")"
+u9_rl_other="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b\",\"exp\":$((now + 300))}")"
+
+# Si un GET a /alerts/sent cayera en `alerts-route` (5/min), esta ráfaga habría
+# fallado mucho antes del vigésimo.
+for _ in $(seq 1 19); do
+  route_status GET "${u9_sent}" "${u9_rl_token}" >/dev/null
+done
+check "el request 20 de sent en el minuto todavía pasa" \
+  200 "$(route_status GET "${u9_sent}" "${u9_rl_token}")"
+check "el request 21 de sent en el minuto → 429" \
+  429 "$(route_status GET "${u9_sent}" "${u9_rl_token}")"
+check "otro usuario no comparte el contador de sent" \
+  200 "$(route_status GET "${u9_sent}" "${u9_rl_other}")"
+
+u9_wait_clock_minute 15
+for _ in $(seq 1 29); do
+  route_status PUT "${u9_seen}" "${u9_rl_token}" >/dev/null
+done
+check "el request 30 de seen en el minuto todavía pasa" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_rl_token}")"
+check "el request 31 de seen en el minuto → 429" \
+  429 "$(route_status PUT "${u9_seen}" "${u9_rl_token}")"
+check "otro usuario no comparte el contador de seen" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_rl_other}")"
+
+echo
+echo "Rutas de US-09: detrás de un proxy (KONG_TRUSTED_IPS)"
+
+# Nginx Proxy Manager termina el TLS delante de Kong y reenvía la IP real en
+# `X-Forwarded-For`. El proxy se simula con el propio curl dentro del
+# contenedor: su peer es 127.0.0.1, que es lo que se declara de confianza.
+# Con la lista vacía (el Gateway principal) el header del cliente se ignora.
+echo "==> Levantando un Gateway con KONG_TRUSTED_IPS"
+docker run -d --name "${GATEWAY_PROXY}" --network "${NETWORK}"   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")"   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro"   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080"   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080"   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080"   -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080"   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080"   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}"   -e ATTESTATION_SOURCE=google   -e ATTESTATION_SSL_VERIFY=false   -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}"   -e "JWT_ISSUER=${JWT_ISSUER}"   -e "KONG_TRUSTED_IPS=127.0.0.1/32"   vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_PROXY}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_PROXY}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El Gateway con KONG_TRUSTED_IPS no llegó a estar healthy:"
+  docker logs "${GATEWAY_PROXY}"
+  exit 1
+fi
+
+u9_proxy_headers=(-H "Authorization: Bearer ${u9_token}" -H 'X-Forwarded-For: 203.0.113.7')
+u9_proxy_view="$(docker exec "${GATEWAY_PROXY}" curl -s   -X GET "http://127.0.0.1:8000${u9_sent}" "${u9_proxy_headers[@]}" | tr '[:upper:]' '[:lower:]')"
+check_contains "con proxy de confianza, Kong toma la IP real del X-Forwarded-For (sent)"   "\"x-real-ip\": \"203.0.113.7\"" "${u9_proxy_view}"
+check_contains "con proxy de confianza, X-User-Id sigue llegando del JWT (sent)"   "\"x-user-id\": \"${u9_user}\"" "${u9_proxy_view}"
+check "con proxy de confianza, PUT .../seen sigue ruteando"   200 "$(docker exec "${GATEWAY_PROXY}" curl -s -o /dev/null -w '%{http_code}'     -X PUT "http://127.0.0.1:8000${u9_seen}" "${u9_proxy_headers[@]}")"
+check "con proxy de confianza, sin JWT sigue siendo 401"   401 "$(docker exec "${GATEWAY_PROXY}" curl -s -o /dev/null -w '%{http_code}'     -X GET "http://127.0.0.1:8000${u9_sent}" -H 'X-Forwarded-For: 203.0.113.7')"
+
+u9_direct_view="$(docker exec "${GATEWAY}" curl -s   -X GET "http://127.0.0.1:8000${u9_sent}" "${u9_proxy_headers[@]}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "sin proxy de confianza, el X-Forwarded-For del cliente se ignora"   "\"x-real-ip\": \"203.0.113.7\"" "${u9_direct_view}"
 
 echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
