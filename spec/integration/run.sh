@@ -1234,6 +1234,137 @@ u9_direct_view="$(docker exec "${GATEWAY}" curl -s   -X GET "http://127.0.0.1:80
 check_not_contains "sin proxy de confianza, el X-Forwarded-For del cliente se ignora"   "\"x-real-ip\": \"203.0.113.7\"" "${u9_direct_view}"
 
 echo
+echo "Baja de cuenta (US-11): matriz de ruteo (users-me-delete-route)"
+
+# El cupo de la baja es de 3/min por usuario, y cada request ruteado a la Route
+# lo consume (un 404 de Kong, un 401 o un 413 no: cortan antes de
+# `rate-limiting`). Por eso cada grupo de requests válidos usa su propio
+# usuario, en lugar de reutilizar uno y chocar con el 429.
+u11_me="/api/v1/users/me"
+u11_user="3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
+u11_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u11_user}\",\"exp\":$((now + 300))}")"
+u11_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u11_user}\",\"exp\":$((now - 300))}")"
+u11_status_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"6f7a8b9c-0d1e-4f2a-8b3c-4d5e6f7a8b9c\",\"exp\":$((now + 300))}")"
+u11_size_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"7a8b9c0d-1e2f-4a3b-9c4d-5e6f7a8b9c0d\",\"exp\":$((now + 300))}")"
+
+# Un solo request devuelve a la vez el status y los headers de la Route que lo
+# atendió: cada Route declara su propio `rate-limiting`, y Kong expone su
+# límite en `X-RateLimit-Limit-*`.
+u11_headers="$(route_headers DELETE "${u11_me}" "${u11_token}")"
+check_contains "DELETE /api/v1/users/me → users-me-delete-route" \
+  "http/1.1 200" "${u11_headers}"
+check_contains "DELETE /api/v1/users/me lo atiende users-me-delete-route (3/min)" \
+  "x-ratelimit-limit-minute: 3" "${u11_headers}"
+check_contains "DELETE /api/v1/users/me lo atiende users-me-delete-route (10/h)" \
+  "x-ratelimit-limit-hour: 10" "${u11_headers}"
+
+# Los demás métodos sobre el mismo path no tienen Route: sólo el GET del
+# scaffold `identity-profile`, que sigue como estaba.
+check "PUT /api/v1/users/me (método sin Route) → 404" \
+  404 "$(route_status PUT "${u11_me}" "${u11_token}")"
+check "POST /api/v1/users/me (método sin Route) → 404" \
+  404 "$(route_status POST "${u11_me}" "${u11_token}")"
+check "PATCH /api/v1/users/me (método sin Route) → 404" \
+  404 "$(route_status PATCH "${u11_me}" "${u11_token}")"
+
+# Path exacto: la Route no captura subrecursos ni paths con el mismo prefijo.
+check "DELETE /api/v1/users/me/ (barra final) → 404" \
+  404 "$(route_status DELETE "${u11_me}/" "${u11_token}")"
+check "DELETE /api/v1/users/me/extra → 404" \
+  404 "$(route_status DELETE "${u11_me}/extra" "${u11_token}")"
+check "DELETE /api/v1/users/mex (mismo prefijo) → 404" \
+  404 "$(route_status DELETE /api/v1/users/mex "${u11_token}")"
+
+# Ninguna Route existente captura el path nuevo, ni al revés.
+u11_profile_view="$(docker exec "${GATEWAY}" curl -s \
+  -X GET "http://127.0.0.1:8000${u11_me}" \
+  -H "Authorization: Bearer ${u11_token}" | tr '[:upper:]' '[:lower:]')"
+check_contains "GET /api/v1/users/me sigue en identity-profile (X-User-Hash)" \
+  "\"x-user-hash\":" "${u11_profile_view}"
+check_not_contains "GET /api/v1/users/me no pasa por users-me-delete-route (sin X-User-Id)" \
+  "\"x-user-id\":" "${u11_profile_view}"
+check "DELETE /api/v1/notifications/tokens sigue en notification-tokens-delete-route" \
+  200 "$(route_status DELETE /api/v1/notifications/tokens "${u11_token}")"
+
+echo
+echo "Baja de cuenta (US-11): seguridad (JWT y Token Offloading)"
+
+check "sin Authorization, 401: DELETE /users/me" \
+  401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:8000${u11_me}" \
+    -H 'Content-Type: application/json' --data-binary '{"password":"x"}')"
+check "JWT expirado, 401: DELETE /users/me" \
+  401 "$(route_status DELETE "${u11_me}" "${u11_expired}")"
+check "JWT mal formado, 401: DELETE /users/me" \
+  401 "$(route_status DELETE "${u11_me}" "no-es-un-jwt")"
+
+u11_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+  -X DELETE "http://127.0.0.1:8000${u11_me}" \
+  -H "Authorization: Bearer ${u11_token}" \
+  -H 'X-User-Id: usuario-suplantado' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"password":"contrasena-de-prueba"}' | tr '[:upper:]' '[:lower:]')"
+check_contains "X-User-Id del JWT llega al upstream: DELETE /users/me" \
+  "\"x-user-id\": \"${u11_user}\"" "${u11_spoofed_view}"
+check_not_contains "el X-User-Id forjado se descarta: DELETE /users/me" \
+  "usuario-suplantado" "${u11_spoofed_view}"
+check_not_contains "el Authorization no se propaga: DELETE /users/me" \
+  "authorization" "${u11_spoofed_view}"
+check_contains "el body con la contraseña se reenvía sin tocar: DELETE /users/me" \
+  "contrasena-de-prueba" "${u11_spoofed_view}"
+
+echo
+echo "Baja de cuenta (US-11): las respuestas de Identity se propagan"
+
+# El upstream de eco devuelve el status que pide `x-set-response-status-code`.
+# El Gateway no transforma las respuestas de esta Route: un 204 o un 401 de
+# Identity (`INVALID_PASSWORD`) llegan al cliente tal cual.
+check "el 204 de Identity se propaga" \
+  204 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:8000${u11_me}" \
+    -H "Authorization: Bearer ${u11_status_token}" \
+    -H 'Content-Type: application/json' \
+    -H 'x-set-response-status-code: 204' \
+    --data-binary '{"password":"x"}')"
+check "el 401 INVALID_PASSWORD de Identity se propaga" \
+  401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:8000${u11_me}" \
+    -H "Authorization: Bearer ${u11_status_token}" \
+    -H 'Content-Type: application/json' \
+    -H 'x-set-response-status-code: 401' \
+    --data-binary '{"password":"x"}')"
+
+echo
+echo "Baja de cuenta (US-11): límite de tamaño (1 KB)"
+
+# El 413 de Kong corta antes de `rate-limiting` y no gasta cupo.
+check "baja de 1500 bytes (> 1 KB) → 413" \
+  413 "$(sized_status DELETE "${u11_me}" "${u11_size_token}" 1500)"
+check "baja de 900 bytes (≤ 1 KB) pasa" \
+  200 "$(sized_status DELETE "${u11_me}" "${u11_size_token}" 900)"
+
+echo
+echo "Baja de cuenta (US-11): rate limiting por X-User-Id (3/min)"
+
+# Mismo guard de reloj que el de US-09: la ventana fija del contador `local` se
+# alinea al minuto de reloj y, si la ráfaga la cruzara, se reiniciaría y
+# enmascararía el corte esperado.
+u9_wait_clock_minute 40
+
+u11_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"8b9c0d1e-2f3a-4b4c-8d5e-6f7a8b9c0d1e\",\"exp\":$((now + 300))}")"
+u11_rl_other="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"9c0d1e2f-3a4b-4c5d-9e6f-7a8b9c0d1e2f\",\"exp\":$((now + 300))}")"
+
+for _ in $(seq 1 2); do
+  route_status DELETE "${u11_me}" "${u11_rl_token}" >/dev/null
+done
+check "la baja 3 del minuto todavía pasa" \
+  200 "$(route_status DELETE "${u11_me}" "${u11_rl_token}")"
+check "la baja 4 del minuto → 429" \
+  429 "$(route_status DELETE "${u11_me}" "${u11_rl_token}")"
+check "otro usuario no comparte el contador de la baja" \
+  200 "$(route_status DELETE "${u11_me}" "${u11_rl_other}")"
+
+echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
 
 # Mismo usuario que en las secciones anteriores: el rate-limiting de esta
