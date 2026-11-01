@@ -45,6 +45,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Rate limiting global | ✅ |
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
+| Ruteo y rate limiting por usuario en `/alerts/sent` (20/min) y `PUT /alerts/{uuid}/seen` (30/min), US-09 | ✅ |
 | Rate limiting por usuario en el alta de `/notifications/tokens` (10/día sobre `X-User-Id`) | ✅ |
 | La baja de `/notifications/tokens` sin rate limiting (deliberado, ver más abajo) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
@@ -54,7 +55,7 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 91 tests unitarios + 88 de integración | ✅ |
+| CI: 104 tests unitarios + 123 de integración | ✅ |
 
 ## Estructura
 
@@ -482,10 +483,9 @@ paginación.
 
 ### Precedencia frente a `POST /alerts`
 
-Ambas Routes comparten el prefijo `/api/v1/alerts`, pero Kong resuelve por
-método además de por path: `alerts-route` declara `methods: [POST]` de forma
-explícita, así que un `GET` nunca puede matchearla, sin importar la
-especificidad del path. Verificado en la suite de integración con una
+Ambas Routes comparten el prefijo `/api/v1/alerts`, pero `alerts-route` es de
+path exacto (US-08) y además declara `methods: [POST]` de forma explícita, así
+que un `GET` nunca puede matchearla. Verificado en la suite de integración con una
 secuencia de 20 requests exitosos a `/alerts/inbox` seguidos de un 21° que
 recibe `429` — si el `GET` hubiera caído por error en `alerts-route`, esa
 secuencia habría fallado mucho antes del vigésimo request, contra el límite de
@@ -497,6 +497,54 @@ El DTO de salida (`id`, `alert_type`, `created_at`) es responsabilidad
 exclusiva de Alert; el Gateway no inspecciona el body de la respuesta, sólo la
 perimetra. La regla de anonimato del emisor —nunca `issuer_id`, `owner_id` ni
 la patente hacia el cliente— vive en el contrato compartido, no en este repo.
+
+## Intento, evidencia, feedback y reporte: `/alerts/...` (US-08)
+
+Cuatro Routes nuevas sobre `alert-service` (sus timeouts no cambian), más
+límite de tamaño en `POST /alerts`. Mismo perímetro base que `/alerts`: `jwt` +
+`token-offloading` (`X-User-Id`), sin `app-attestation` (fuera de alcance de
+US-08).
+
+| Route | Método y path | Límite por usuario | Tamaño máximo |
+|---|---|---|---|
+| `alerts-route` | `POST /api/v1/alerts` (multipart) | 5/min, 10/h | 5 MB |
+| `alerts-attempts-route` | `POST /api/v1/alerts/attempts` | 10/min, 30/h | 8 KB |
+| `alerts-evidence-route` | `GET /api/v1/alerts/{uuid}/evidence/{GENERAL\|PLATE\|DETAIL\|CONTEXT}/{0-9}` | 60/min | — |
+| `alerts-feedback-route` | `PUT /api/v1/alerts/{uuid}/feedback` | 30/min | 1 KB |
+| `alerts-report-route` | `POST /api/v1/alerts/{uuid}/report` | 5/min, 20/h | 1 KB |
+
+- **Paths exactos.** Toda Route que comparte el prefijo `/api/v1/alerts` se
+  declara con regex anclada (`~...$`): ningún prefijo captura el subrecurso de
+  otro endpoint. `vehicles-route` también es exacta, así que el viejo
+  `POST /api/v1/vehicles/check` (eliminado: el check lo hace Alert con el
+  intento) responde `404` de Kong.
+- **Tamaño.** Cada Route con body lleva su propio `request-size-limiting`; el
+  techo global de nginx (`5m`) no lo reemplaza. El multipart de `POST /alerts`
+  queda en memoria (`client_body_buffer_size = 5m`) y el Gateway sólo lo
+  reenvía, sin inspeccionarlo ni bufferizarlo a disco. El límite corre antes
+  que `rate-limiting`, así que un `413` no gasta cupo.
+- **Rate limit por `X-User-Id`.** `attempts` es un oráculo de pertenencia de
+  patentes y `report` puede poner a un emisor en revisión: de ahí los límites
+  estrictos. Cada Route tiene contador propio y dos usuarios nunca lo
+  comparten.
+- **Diferencia conocida con el contrato.** Ante un timeout del upstream Kong
+  responde `504`, mientras que el contrato de US-08 usa `503` para las
+  dependencias caídas. No se reescribe en el Gateway.
+
+## Buzón de Enviados: `/alerts/sent` y `/alerts/{uuid}/seen` (US-09)
+
+Dos Routes más sobre `alert-service`, con el mismo perímetro que
+`alerts-inbox-route`: `jwt` + `token-offloading` (`X-User-Id`) + `rate-limiting`
+por `X-User-Id`, sin `app-attestation`.
+
+| Route | Método y path | Límite por usuario |
+|---|---|---|
+| `alerts-sent-route` | `GET /api/v1/alerts/sent` (`limit`/`cursor` en la query) | 20/min |
+| `alerts-seen-route` | `PUT /api/v1/alerts/{uuid}/seen` | 30/min |
+
+Ambas son de path exacto (regex anclada), así que ni `alerts-route`
+(`~/api/v1/alerts$`) ni ninguna otra las captura, y ellas no capturan nada
+ajeno. `seen` no lleva `request-size-limiting`: no tiene body (responde `204`).
 
 ## Registro y Baja de Tokens FCM: `/notifications/tokens` (US-06)
 
@@ -648,16 +696,146 @@ Los rechazos generados por los plugins propios comparten una única forma
 |---|---|---|---|
 | Atestación ausente, mal formada, con firma inválida, expirada o con veredicto rechazado | `403` | `forbidden` | `invalid_attestation` |
 | JWT de sesión del que no se puede derivar identidad | `401` | `unauthorized` | `invalid_token` |
+| Google/Play Integrity inalcanzable, o sin respuesta dentro del presupuesto del par de llamadas | `503` | `service_unavailable` | `dependency_unavailable` |
+| Google/Play Integrity respondió `5xx`, o un `200` con un cuerpo fuera de contrato | `502` | `bad_gateway` | `dependency_error` |
+| Credenciales o configuración propias inválidas frente a Google (access token rechazado, service account ilegible) | `500` | `internal_error` | `gateway_fault` |
 
 El motivo real (`invalid_signature`, `expired_token`, `device_verdict_rejected`,
 …) va **sólo al log**: distinguirlos en la respuesta le diría a quien está
 sondeando el control exactamente qué validación tocó. Nunca se loguea el token
 ni la PSK.
 
+Las tres últimas filas son deliberadamente distintas de `invalid_attestation`:
+- Una dependencia caída o que responde fuera de contrato no es un veredicto
+  negativo sobre el dispositivo del cliente, y tratarla como tal le haría
+  creer que el problema es suyo (no reintentable) cuando en realidad es
+  transitorio y ajeno a él.
+- Una credencial propia inválida (el access token de OAuth que el propio
+  Gateway le presenta a Play Integrity, o el service account del que sale
+  ese token) tampoco es culpa del cliente ni una dependencia caída: es un
+  defecto de configuración de este lado. Expulsar al cliente con un `403`
+  por un error nuestro, además de ser engañoso, le oculta el incidente al
+  operador detrás de una señal que sugiere "dispositivo no confiable".
+
+La distinción es posible porque `app-attestation` es código propio que puede
+clasificar la falla antes de responder; no existe un mecanismo equivalente
+para interceptar la respuesta nativa de Kong (ver nota siguiente).
+
 > Los rechazos que produce el propio Kong (`429` de rate limiting, `401` del
-> plugin `jwt`, `404` sin Route, `502/503` del upstream) conservan su formato
-> nativo `{"message": "..."}`. Unificarlos requeriría reescribir las respuestas
-> de error de Kong y queda fuera del alcance de US-01.
+> plugin `jwt`, `404` sin Route) conservan su formato nativo
+> `{"message": "..."}`. Unificarlos requeriría reescribir las respuestas de
+> error de Kong y queda fuera de alcance.
+>
+> Un upstream interno (`identity-service`, `vehicle-service`, `alert-service`,
+> `notification-service`) que no responde dentro de su `read_timeout` recibe
+> `504` de Kong — no `503` — porque el proxy nativo de Kong, a diferencia del
+> cliente HTTP propio que usa `app-attestation` contra Google, no ofrece un
+> punto donde reclasificar ese código antes de responder. Es una excepción
+> deliberada y documentada al criterio general de la plataforma (503 =
+> dependencia propia no disponible), no una inconsistencia pendiente.
+
+## Presupuesto de latencia
+
+Cada request que atraviesa el Gateway tiene un techo de 12000ms en el peor
+caso: `2 × connect_timeout + read_timeout` (el `2 ×` es por el reintento de
+`retries: 1` ante un fallo de conexión; `write_timeout` no participa —
+mide tiempo ENTRE escrituras sucesivas al upstream, no la transferencia
+total, y con el body ya bufferizado por Kong antes de reenviarlo, ni la
+selfie de signup lo dispara en una red interna. Verificado en la suite de
+integración, ver "Resiliencia (K2)").
+
+| Service | `connect_timeout` | `read_timeout` | `write_timeout` | Peor caso |
+|---|---|---|---|---|
+| `identity-service` | 1000 | 6000 | 6000 | 8000 |
+| `vehicle-service` | 1000 | 9000 | 9000 | 11000 |
+| `alert-service` | 1000 | 9000 | 9000 | 11000 |
+| `notification-service` | 1000 | 9000 | 9000 | 11000 |
+
+`identity-service` queda más ajustado porque sus Routes (`/auth/signup`,
+`/auth/signin`, `/auth/refresh`) además cargan `app-attestation`, que reparte
+el resto del presupuesto (hasta 4000ms) contra Google: `8000 + 4000 = 12000`.
+Las otras tres Routes no tienen esa dependencia y usan el presupuesto
+completo.
+
+Dentro de `app-attestation`, el canje de OAuth y el POST a
+`decodeIntegrityToken` comparten un presupuesto agregado de 4000ms
+(`ATTESTATION_DEPENDENCY_TIMEOUT_MS`), no 4000ms cada uno: lo que consume el
+primero se descuenta del segundo. Con el access token en caché (el caso
+común, dura una hora) el primero ni ocurre, así que el segundo dispone del
+agregado completo. Cada llamada además respeta un techo individual de 3000ms
+(`ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS`), para que ninguna de las dos pueda
+sola agotar el presupuesto del par.
+
+## Healthchecks de los upstreams
+
+Los cuatro Services (`identity-service`, `vehicle-service`, `alert-service`,
+`notification-service`) resuelven contra un `Upstream` propio con dos
+healthchecks, no uno. La salud de la instancia la decide el activo:
+
+- **Activo**, contra `GET /ready` de cada servicio, directo al target — por
+  fuera de cualquier Route de Kong, igual que `/internal/*`: no es tráfico
+  público, así que no necesita (ni puede tener) una Route. `/ready` chequea
+  sólo la base propia del servicio. Detecta una caída aunque no haya tráfico
+  real, y es lo único que cuenta respuestas HTTP: un `5xx` de `/ready` suma
+  una falla.
+- **Pasivo**, sobre el tráfico real que ya proxea el Gateway. Reacciona más
+  rápido que el intervalo del activo cuando hay tráfico, pero sólo cuenta
+  fallas de transporte: error de conexión y timeout. **Nunca el status HTTP**
+  (`http_failures: 0`).
+
+El pasivo no cuenta HTTP porque un `503` emitido por un servicio es
+contención por ruta: una dependencia caída detrás de su propio breaker, no
+una instancia enferma. Si contara, sacaría del balanceo a la instancia
+entera y con ella a las rutas que sí funcionan (RENAPER caído → `signup`
+`503` → Identity fuera del balanceo → se cae también `signin`). Un `4xx`
+tampoco cuenta, por la misma razón.
+
+Kong no tiene un "tiempo de apertura" separado como otros circuit breakers:
+un target marcado no sano se vuelve a probar al mismo intervalo del
+healthcheck activo (`UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS`, 10s por defecto),
+y recién vuelve a sano tras acumular `UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD`
+(2) éxitos consecutivos. Esa duración de apertura es ese intervalo
+multiplicado por ese umbral, no un valor propio — es lo más parecido a esa
+noción que ofrece el mecanismo nativo de Kong.
+`UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD` (3) rige las fallas consecutivas
+de `/ready` en el activo y los errores de conexión y timeouts en el pasivo.
+
+Con un target marcado no sano, Kong responde `503` sin intentar la conexión
+— el caso "circuito abierto" del contrato. Es distinto de un `503` emitido
+por el propio servicio (que Kong reenvía tal cual sin sacarlo del balanceo)
+y del `504` de "Contrato de error" más arriba, que es el timeout de una
+request puntual contra un target que sigue sano.
+
+La suite de integración (sección "Resiliencia (Ola 5)") fija estos tres
+comportamientos contra un upstream controlable, con el healthcheck activo
+acelerado a 1s: diez `503` repetidos del upstream (y cinco `4xx`) siguen
+llegando a él, y un `/ready` no sano devuelve `503` del balanceador sin que
+ninguna request toque el upstream. La misma sección verifica, contra el stub
+de Google, el reparto del presupuesto de 4000ms entre el canje de OAuth y
+`decodeIntegrityToken`, y que un Google colgado corta en `503` y nunca
+espera indefinidamente.
+
+### Recuperación
+
+Un target que salió del balanceo vuelve cuando `/ready` se recupera, sea cual
+sea la causa de la salida: lo fija la suite con tres casos (marcado por el
+activo, por timeouts del pasivo y por errores de conexión del pasivo). Lo
+único que lo permite es que el activo siga sondeando los targets no sanos:
+con `healthchecks.active.unhealthy.interval` en `0` Kong no los vuelve a
+probar y un corte breve de la base del servicio lo dejaría fuera para
+siempre. Por eso `UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS` (que gobierna ese
+intervalo) tiene que ser un entero positivo y el Gateway no arranca con otro
+valor.
+
+`UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS` rige, en cambio, el sondeo de
+los targets sanos (`healthy.interval`), y también tiene que ser mayor que 0:
+con `0` el activo no los sondea y un servicio con su base caída que sigue
+respondiendo `503` nunca saldría del balanceo, lo opuesto al contrato (la
+salud la decide `/ready`). El Gateway tampoco arranca con ese valor, salvo que
+se declare `GATEWAY_TEST_MODE=true` (y entonces lo avisa por WARN). Sólo la
+suite de integración usa ese modo: pone el intervalo en `0` para que el activo
+no marque el target antes que el pasivo y así poder aislar los casos del
+pasivo; la recuperación sigue siendo por el activo.
 
 ## Convenciones
 

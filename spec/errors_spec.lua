@@ -32,6 +32,27 @@ describe("contrato de error del Gateway", function()
     assert.same({ error = "unauthorized", reason = "invalid_token" }, body)
   end)
 
+  it("responde 503 service_unavailable ante una dependencia inalcanzable", function()
+    local status, body = errors.build(errors.DEPENDENCY_UNAVAILABLE)
+
+    assert.equals(503, status)
+    assert.same({ error = "service_unavailable", reason = "dependency_unavailable" }, body)
+  end)
+
+  it("responde 502 bad_gateway ante una dependencia que responde fuera de contrato", function()
+    local status, body = errors.build(errors.DEPENDENCY_ERROR)
+
+    assert.equals(502, status)
+    assert.same({ error = "bad_gateway", reason = "dependency_error" }, body)
+  end)
+
+  it("responde 500 internal_error ante credenciales propias inválidas", function()
+    local status, body = errors.build(errors.GATEWAY_FAULT)
+
+    assert.equals(500, status)
+    assert.same({ error = "internal_error", reason = "gateway_fault" }, body)
+  end)
+
   it("no expone el motivo interno del rechazo", function()
     local _, body = errors.build(errors.INVALID_ATTESTATION)
 

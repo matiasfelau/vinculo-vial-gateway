@@ -18,34 +18,44 @@ describe("fuente google", function()
     end)
 
     it("distingue un token rechazado por Google de un problema nuestro", function()
-      -- 400: el token es inválido, manipulado o de otra app. Culpa del cliente.
-      local verdict, reason = google.parse_response(400, '{"error":{"code":400}}')
+      -- 400: el token es inválido, manipulado o de otra app. Culpa del
+      -- cliente: no es una falla de dependencia, así que no cuenta como tal.
+      local verdict, reason, kind = google.parse_response(400, '{"error":{"code":400}}')
       assert.is_nil(verdict)
       assert.equals("playintegrity_token_rejected", reason)
+      assert.equals("rejected", kind)
 
-      -- 401/403: nuestras credenciales. El cliente no puede hacer nada.
+      -- 401/403: nuestro access token de OAuth es inválido. Defecto propio
+      -- del Gateway: ni "el cliente hizo algo mal" (403) ni "Google está
+      -- caído" (502/503).
       for _, status in ipairs({ 401, 403 }) do
-        local _, unauthorized = google.parse_response(status, "{}")
+        local _, unauthorized, unauthorized_kind = google.parse_response(status, "{}")
         assert.equals("playintegrity_unauthorized", unauthorized)
+        assert.equals("gateway_fault", unauthorized_kind)
       end
     end)
 
-    it("reporta el status ante cualquier otro error", function()
-      local verdict, reason = google.parse_response(503, "unavailable")
+    it("clasifica un 5xx como falla de dependencia", function()
+      local verdict, reason, kind = google.parse_response(503, "unavailable")
       assert.is_nil(verdict)
       assert.equals("playintegrity_http_503", reason)
+      assert.equals("upstream_error", kind)
     end)
 
     it("rechaza una respuesta 200 que no es JSON", function()
-      local verdict, reason = google.parse_response(200, "<html>error</html>")
+      local verdict, reason, kind = google.parse_response(200, "<html>error</html>")
       assert.is_nil(verdict)
       assert.equals("playintegrity_malformed_response", reason)
+      -- Un 200 que incumple el contrato de respuesta es, para este propósito,
+      -- la misma categoría que un 5xx: la dependencia no cumplió lo prometido.
+      assert.equals("upstream_error", kind)
     end)
 
     it("rechaza una respuesta 200 sin el payload esperado", function()
-      local verdict, reason = google.parse_response(200, '{"otraCosa":{}}')
+      local verdict, reason, kind = google.parse_response(200, '{"otraCosa":{}}')
       assert.is_nil(verdict)
       assert.equals("playintegrity_missing_payload", reason)
+      assert.equals("upstream_error", kind)
     end)
   end)
 end)

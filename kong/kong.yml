@@ -9,17 +9,175 @@
 _format_version: "3.0"
 _transform: true
 
+# ── Upstreams ────────────────────────────────────────────────────────────────
+# Uno por Service, con healthchecks activos y pasivos. La salud de la
+# instancia la decide el activo: prueba `/ready` (que cada servicio resuelve
+# contra su base propia, nada más) directo contra el target —nunca a través
+# del proxy, así que no necesita (ni puede tener) una Route— al igual que
+# `/internal/*`, no es tráfico público; detecta una caída aunque no haya
+# tráfico real.
+#
+# El pasivo observa el tráfico real que ya proxea el Gateway, pero sólo
+# cuenta fallas de transporte (error de conexión y timeout), NUNCA el status
+# HTTP (`http_failures: 0`). Un 503 emitido por un servicio es contención por
+# ruta —una dependencia caída detrás de su propio breaker—, no una instancia
+# enferma: si contara, sacaría del balanceo a la instancia entera y con ella
+# a todas las rutas que sí funcionan (RENAPER caído → signup 503 → Identity
+# fuera del balanceo → se cae también signin).
+#
+# Kong no tiene un "tiempo de apertura" separado como otros circuit breakers:
+# un target marcado no sano se vuelve a probar cada
+# UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS (`unhealthy.interval`), y recién
+# vuelve a sano tras acumular UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD éxitos
+# consecutivos. La duración de apertura es ese intervalo multiplicado por ese
+# umbral, no un valor propio. Ese intervalo nunca puede ser 0 (el entrypoint
+# lo rechaza): sin sondeo, un target marcado por el activo o por el pasivo no
+# vuelve jamás. `healthy.interval` (UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS)
+# es independiente: rige el sondeo de los targets sanos, y tampoco puede ser 0
+# fuera de GATEWAY_TEST_MODE: sin sondearlos, un servicio con su base caída que
+# responde 503 nunca saldría del balanceo, y la salud la decide /ready.
+upstreams:
+  - name: identity-upstream
+    targets:
+      - target: ${IDENTITY_SERVICE_TARGET}
+    healthchecks:
+      active:
+        type: http
+        http_path: /ready
+        timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
+        healthy:
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200]
+        unhealthy:
+          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          http_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          http_statuses: [500, 501, 502, 503, 504, 505]
+      passive:
+        type: http
+        healthy:
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                          300, 301, 302, 303, 304, 305, 306, 307, 308]
+        unhealthy:
+          http_failures: 0
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+
+  - name: vehicle-upstream
+    targets:
+      - target: ${VEHICLE_SERVICE_TARGET}
+    healthchecks:
+      active:
+        type: http
+        http_path: /ready
+        timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
+        healthy:
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200]
+        unhealthy:
+          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          http_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          http_statuses: [500, 501, 502, 503, 504, 505]
+      passive:
+        type: http
+        healthy:
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                          300, 301, 302, 303, 304, 305, 306, 307, 308]
+        unhealthy:
+          http_failures: 0
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+
+  - name: alert-upstream
+    targets:
+      - target: ${ALERT_SERVICE_TARGET}
+    healthchecks:
+      active:
+        type: http
+        http_path: /ready
+        timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
+        healthy:
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200]
+        unhealthy:
+          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          http_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          http_statuses: [500, 501, 502, 503, 504, 505]
+      passive:
+        type: http
+        healthy:
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                          300, 301, 302, 303, 304, 305, 306, 307, 308]
+        unhealthy:
+          http_failures: 0
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+
+  - name: notification-upstream
+    targets:
+      - target: ${NOTIFICATION_SERVICE_TARGET}
+    healthchecks:
+      active:
+        type: http
+        http_path: /ready
+        timeout: ${UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS}
+        healthy:
+          interval: ${UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS}
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200]
+        unhealthy:
+          interval: ${UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS}
+          http_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          http_statuses: [500, 501, 502, 503, 504, 505]
+      passive:
+        type: http
+        healthy:
+          successes: ${UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD}
+          http_statuses: [200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                          300, 301, 302, 303, 304, 305, 306, 307, 308]
+        unhealthy:
+          http_failures: 0
+          tcp_failures: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+          timeouts: ${UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD}
+
 services:
   # ── vinculo-vial-identity ──────────────────────────────────────────────────
   # Servicio de identidad: registro, autenticación y gestión de usuarios.
   - name: identity-service
-    url: ${IDENTITY_SERVICE_URL}
+    # `host` referencia el Upstream de arriba por nombre, no una URL directa:
+    # es lo que habilita el balanceo con healthchecks. protocol/port vienen
+    # del mismo origen que su target (ver entrypoint.sh: derive_url_parts).
+    protocol: ${IDENTITY_SERVICE_PROTOCOL}
+    host: identity-upstream
+    port: ${IDENTITY_SERVICE_PORT}
     # El registro es una operación no idempotente (crea un usuario): sólo se
     # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
     retries: 1
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Presupuesto de latencia del Gateway por request: 12000ms en el peor
+    # caso (2 × connect_timeout, por el reintento ante fallo de conexión, más
+    # read_timeout; write_timeout no cuenta porque mide tiempo ENTRE
+    # escrituras sucesivas al upstream, no la transferencia total — con el
+    # body ya bufferizado por Kong antes de reenviarlo, la selfie de signup
+    # viaja por red interna en pocas escrituras consecutivas y no lo
+    # dispara). Las Routes de este Service además cargan `app-attestation`
+    # (hasta 4000ms agregados contra Google): connect_timeout y read_timeout
+    # se acotan más que en el resto para dejarle ese margen.
+    connect_timeout: 1000
+    write_timeout: 6000
+    read_timeout: 6000
     routes:
       # US-01 — Registro. El body es un sobre HPKE: el Gateway no lo inspecciona
       # ni lo modifica, sólo lo reenvía.
@@ -87,6 +245,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-02 — Login. Mismo esquema de body que signup: sobre HPKE, el
       # Gateway no lo inspecciona ni lo modifica, sólo lo reenvía. Identity
@@ -140,6 +303,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # US-03 — Gestión de Sesión (RTR). El body es `{ "refresh_token": "<...>" }`,
       # un string opaco SIN el sobre HPKE de signup/signin: la confidencialidad
@@ -182,6 +350,11 @@ services:
               accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
               max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
               request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              # Presupuesto agregado del par OAuth + decodeIntegrityToken, y
+              # techo de cada llamada individual dentro de ese agregado — ver
+              # sources/google.fetch.
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
 
       # Deliberadamente SIN `app-attestation`: cerrar sesión es una acción de
       # seguridad del usuario, no una operación que emita credenciales nuevas.
@@ -256,16 +429,31 @@ services:
   # reenvía. `/internal/verify-ownership` (Vehicle → Identity) es tráfico
   # interno directo, nunca una Route de Kong — ver más abajo.
   - name: vehicle-service
-    url: ${VEHICLE_SERVICE_URL}
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Mismo criterio que `identity-service`: `host` referencia su Upstream
+    # por nombre para habilitar el balanceo con healthchecks.
+    protocol: ${VEHICLE_SERVICE_PROTOCOL}
+    host: vehicle-upstream
+    port: ${VEHICLE_SERVICE_PORT}
+    # La vinculación de vehículo es una operación no idempotente (crea el
+    # registro de vinculación): mismo criterio que `identity-service`, sólo se
+    # reintenta ante fallos de conexión, nunca ante una respuesta del upstream.
+    retries: 1
+    # Presupuesto de 12000ms en el peor caso (2 × connect_timeout +
+    # read_timeout), igual que `identity-service`, pero sin repartir margen
+    # con ninguna dependencia externa: esta Route no carga `app-attestation`.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       - name: vehicles-route
         methods:
           - POST
+        # Path exacto (regex anclada con `$`): un path de prefijo capturaría
+        # también cualquier subrecurso, p. ej. el viejo `/api/v1/vehicles/check`
+        # (eliminado en US-08: el check ahora lo hace Alert con el intento).
+        # Ese path ya no tiene Route y Kong responde 404.
         paths:
-          - /api/v1/vehicles
+          - ~/api/v1/vehicles$
         strip_path: false
         preserve_host: false
         protocols:
@@ -317,10 +505,20 @@ services:
   # US-07 — Buzón de Alertas (lectura), sobre el mismo Service: ver
   # `alerts-inbox-route`, más abajo.
   - name: alert-service
-    url: ${ALERT_SERVICE_URL}
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Mismo criterio que `identity-service`: `host` referencia su Upstream
+    # por nombre para habilitar el balanceo con healthchecks.
+    protocol: ${ALERT_SERVICE_PROTOCOL}
+    host: alert-upstream
+    port: ${ALERT_SERVICE_PORT}
+    # El alta de alerta es una operación no idempotente: mismo criterio que
+    # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
+    # ante una respuesta del upstream.
+    retries: 1
+    # Mismo presupuesto y mismo motivo que `vehicle-service`: 12000ms en el
+    # peor caso, sin dependencia externa que repartir.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       # Deliberadamente SIN `app-attestation`: decisión cerrada del
       # contrato de US-05, por velocidad. Sin esa capa, `rate-limiting`
@@ -331,8 +529,11 @@ services:
       - name: alerts-route
         methods:
           - POST
+        # Path exacto (regex anclada con `$`), no de prefijo: un prefijo
+        # capturaría los subrecursos de otros endpoints de `/api/v1/alerts/...`
+        # (US-08) y los sometería al perímetro de ésta.
         paths:
-          - /api/v1/alerts
+          - ~/api/v1/alerts$
         strip_path: false
         preserve_host: false
         protocols:
@@ -363,6 +564,17 @@ services:
           # cualquiera con un JWT válido podría barrer el endpoint. El
           # cupo es independiente por `X-User-Id` — dos usuarios distintos
           # nunca comparten contador.
+          # Multipart de la llamada 2 (metadata + fotos HPKE): cada parte es
+          # ≤ 1 MiB y el body completo entra en 5 MB. Con
+          # `client_body_buffer_size` en 5m (kong.conf) nginx lo mantiene en
+          # memoria, y el Gateway sólo lo reenvía, sin inspeccionarlo. Es el
+          # límite propio de la Route: el techo global de nginx no lo
+          # reemplaza.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 5
+              size_unit: megabytes
+              require_content_length: false
           - name: rate-limiting
             config:
               minute: 5
@@ -376,11 +588,10 @@ services:
               error_message: "API rate limit exceeded"
 
       # US-07 — Buzón de Alertas (lectura). Comparte prefijo con
-      # `alerts-route` (`/api/v1/alerts`), pero Kong resuelve por método
-      # además de por path: `alerts-route` declara `methods: [POST]` de
-      # forma explícita (más arriba), así que un `GET` nunca puede
-      # matchearla, sin importar la especificidad del path. Verificado
-      # también con un test de integración dedicado.
+      # `alerts-route` (`/api/v1/alerts`), pero `alerts-route` es de path
+      # exacto (US-08) y además declara `methods: [POST]`, así que un `GET`
+      # nunca puede matchearla. Verificado también con un test de
+      # integración dedicado.
       - name: alerts-inbox-route
         methods:
           - GET
@@ -428,6 +639,259 @@ services:
               error_code: 429
               error_message: "API rate limit exceeded"
 
+      # US-08 — Intento, evidencia, feedback y reporte. Todas cuelgan de
+      # `alert-service` (timeouts sin cambios) y comparten el prefijo
+      # `/api/v1/alerts` con `alerts-route`, así que cada una declara un
+      # path exacto (regex anclada con `$`): ningún prefijo puede capturar
+      # el subrecurso de otro endpoint. Mismo par jwt + token-offloading que
+      # `alerts-route` (sin `app-attestation`, fuera de alcance de US-08);
+      # `token-offloading` corre en PRIORITY 1000, antes que `rate-limiting`
+      # (910), para que `X-User-Id` exista cuando éste lee `limit_by: header`.
+      # `request-size-limiting` (951) corre antes que `rate-limiting`: un body
+      # fuera de tope se rechaza con 413 sin gastar cupo.
+      #
+      # Ante un timeout del upstream Kong responde 504, mientras que el
+      # contrato de US-08 usa 503 para las dependencias caídas. Es una
+      # diferencia conocida y aceptada: no se reescribe en el Gateway.
+
+      # Llamada 1: el intento. Responde si el vehículo está en la red, así
+      # que es un oráculo de pertenencia de patentes: de ahí el rate limit
+      # por `X-User-Id`. El body es `{ "pat_enc": "<base64>" }`.
+      - name: alerts-attempts-route
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/alerts/attempts$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 8
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 10
+              hour: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Evidencia redactada para el dueño de la alerta. Lectura: el Gateway
+      # sólo reenvía la imagen que devuelve Alert, sin inspeccionarla ni
+      # transformarla. Los roles e índices válidos se acotan en el path.
+      - name: alerts-evidence-route
+        methods:
+          - GET
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/evidence/(GENERAL|PLATE|DETAIL|CONTEXT)/[0-9]$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 60
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Valoración (👍/👎) de la validación. Body: `{ "rating": "UP|DOWN" }`.
+      - name: alerts-feedback-route
+        methods:
+          - PUT
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/feedback$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Reporte del emisor por el dueño. Cada reporte puede poner al emisor
+      # en revisión, así que el límite es estricto. Body:
+      # `{ "reason": "FALSE_ALERT|SPAM" }`.
+      - name: alerts-report-route
+        methods:
+          - POST
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/report$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 5
+              hour: 20
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # US-09 — Buzón de Enviados. Mismas reglas que las de US-08: comparten el
+      # prefijo `/api/v1/alerts` con `alerts-route`, así que declaran path
+      # exacto (regex anclada con `$`), y el mismo par jwt + token-offloading
+      # (PRIORITY 1000, antes que `rate-limiting`) para que `X-User-Id` exista
+      # cuando éste lee `limit_by: header`. Sin `app-attestation`, igual que el
+      # resto de las Routes de alertas.
+
+      # Lista de alertas del emisor. Lectura idempotente que sólo devuelve
+      # datos del usuario autenticado: mismo cupo que `alerts-inbox-route`. La
+      # paginación (`limit`/`cursor`) viaja en la query string y la valida
+      # Alert, no el Gateway.
+      - name: alerts-sent-route
+        methods:
+          - GET
+        paths:
+          - ~/api/v1/alerts/sent$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 20
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # El dueño marca la alerta como leída al abrir el chat. Idempotente y sin
+      # body (responde 204), así que no lleva `request-size-limiting`.
+      - name: alerts-seen-route
+        methods:
+          - PUT
+        paths:
+          - '~/api/v1/alerts/[0-9a-fA-F-]{36}/seen$'
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
       # Igual que con Vehicle: no existe ninguna Route que matchee
       # `/internal/*`. `/internal/resolve-owner` (Alert → Vehicle) es
       # tráfico interno directo, nunca expuesto en Kong.
@@ -438,10 +902,20 @@ services:
   # sensible en el sentido HPKE del resto de la plataforma, así que el Gateway
   # lo reenvía intacto sin más tratamiento que el perímetro de sesión.
   - name: notification-service
-    url: ${NOTIFICATION_SERVICE_URL}
-    connect_timeout: 5000
-    write_timeout: 15000
-    read_timeout: 15000
+    # Mismo criterio que `identity-service`: `host` referencia su Upstream
+    # por nombre para habilitar el balanceo con healthchecks.
+    protocol: ${NOTIFICATION_SERVICE_PROTOCOL}
+    host: notification-upstream
+    port: ${NOTIFICATION_SERVICE_PORT}
+    # El alta de token FCM es una operación no idempotente: mismo criterio que
+    # `identity-service`, sólo se reintenta ante fallos de conexión, nunca
+    # ante una respuesta del upstream.
+    retries: 1
+    # Mismo presupuesto y mismo motivo que `vehicle-service`: 12000ms en el
+    # peor caso, sin dependencia externa que repartir.
+    connect_timeout: 1000
+    write_timeout: 9000
+    read_timeout: 9000
     routes:
       # Alta de token. Sin `app-attestation` — mismo criterio que /vehicles y
       # /alerts: la sesión (jwt + token-offloading) ya exige un Access Token

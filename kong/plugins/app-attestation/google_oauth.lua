@@ -113,22 +113,32 @@ function M.build_assertion(account, now)
 end
 
 --- Interpreta la respuesta del endpoint de token. Pura, para poder testearla.
+--
+-- A diferencia de decodeIntegrityToken, acá no entra ningún dato del
+-- cliente: es un canje servidor-a-servidor entre el Gateway y Google. No
+-- existe un 4xx que le sea atribuible al cliente — cualquiera que no sea
+-- 5xx es, por descarte, la aserción o las credenciales propias mal
+-- armadas.
+--
 -- @return string access_token, number vida en segundos
--- @return nil, string motivo del fallo
+-- @return nil, string motivo del fallo, string clasificación del fallo
+--         ("upstream_error" si Google respondió 5xx o un cuerpo fuera de
+--         contrato; "gateway_fault" para cualquier otro caso)
 function M.parse_token_response(status, body)
   if status ~= 200 then
     -- El cuerpo del error de Google no contiene datos del usuario, pero sí
     -- puede traer detalles del service account: se reporta sólo el status.
-    return nil, "oauth_http_" .. tostring(status)
+    local kind = status >= 500 and "upstream_error" or "gateway_fault"
+    return nil, "oauth_http_" .. tostring(status), kind
   end
 
   local parsed = cjson.decode(body)
   if type(parsed) ~= "table" then
-    return nil, "oauth_malformed_response"
+    return nil, "oauth_malformed_response", "upstream_error"
   end
 
   if type(parsed.access_token) ~= "string" or parsed.access_token == "" then
-    return nil, "oauth_missing_access_token"
+    return nil, "oauth_missing_access_token", "upstream_error"
   end
 
   return parsed.access_token, tonumber(parsed.expires_in) or ASSERTION_LIFETIME
@@ -156,24 +166,36 @@ local function cache_set(token, expires_in)
 end
 
 --- Devuelve un access token válido, del caché o pidiéndole uno nuevo a Google.
-function M.get_access_token(conf)
+-- @param conf table configuración del plugin
+-- @param timeout_ms number techo de esta llamada en ms. Lo decide el llamador
+--        (`sources/google.fetch`) según cuánto quede del presupuesto agregado
+--        del par de llamadas; por defecto `dependency_call_timeout_ms`, para
+--        que la función siga siendo segura si algún día se llama sola.
+-- @return string access_token
+-- @return nil, string motivo del fallo, string clasificación del fallo (ver
+--         `parse_token_response`; "unavailable" si Google fue inalcanzable o
+--         no respondió dentro de `timeout_ms`)
+function M.get_access_token(conf, timeout_ms)
   local cached = cache_get()
   if cached then
     return cached
   end
 
+  -- No leer o no poder firmar con el service account propio es, por
+  -- definición, un defecto de nuestra configuración: nunca del cliente ni
+  -- de Google.
   local account, account_err = M.load_service_account(conf)
   if not account then
-    return nil, account_err
+    return nil, account_err, "gateway_fault"
   end
 
   local assertion, assertion_err = M.build_assertion(account, ngx.time())
   if not assertion then
-    return nil, assertion_err
+    return nil, assertion_err, "gateway_fault"
   end
 
   local client = http.new()
-  client:set_timeout(conf.http_timeout_ms)
+  client:set_timeout(timeout_ms or conf.dependency_call_timeout_ms)
 
   local res, request_err = client:request_uri(account.token_uri, {
     method = "POST",
@@ -186,12 +208,12 @@ function M.get_access_token(conf)
   })
 
   if not res then
-    return nil, "oauth_unreachable: " .. tostring(request_err)
+    return nil, "oauth_unreachable: " .. tostring(request_err), "unavailable"
   end
 
-  local token, expires_in = M.parse_token_response(res.status, res.body)
+  local token, expires_in, kind = M.parse_token_response(res.status, res.body)
   if not token then
-    return nil, expires_in
+    return nil, expires_in, kind
   end
 
   cache_set(token, expires_in)

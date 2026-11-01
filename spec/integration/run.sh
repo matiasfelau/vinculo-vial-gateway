@@ -15,6 +15,24 @@ readonly NETWORK=vv-integration
 readonly GATEWAY=vv-it-gateway
 readonly STUB=vv-it-google
 readonly UPSTREAM=vv-it-upstream
+# Segundo Gateway y upstream dedicados a la sección de resiliencia (K2):
+# aislados del Gateway principal para no interferir con el resto de la
+# suite — ver esa sección, al final de "Casos".
+readonly GATEWAY_SLOW=vv-it-gateway-slow
+readonly SLOW_UPSTREAM=vv-it-slow-upstream
+# Tercer Gateway y upstream controlable, para la sección de resiliencia del
+# balanceo y del presupuesto de las llamadas a Google (ver "Resiliencia (Ola 5)").
+readonly GATEWAY_RESILIENCE=vv-it-gateway-resilience
+readonly FLAKY_UPSTREAM=vv-it-flaky-upstream
+# Cuarto Gateway (sin sondeo activo de targets sanos, para que sólo el
+# healthcheck pasivo pueda sacar un target del balanceo) y un upstream que
+# arranca con el puerto cerrado, para la recuperación de targets marcados por
+# el pasivo.
+readonly GATEWAY_PASSIVE=vv-it-gateway-passive
+readonly LATE_UPSTREAM=vv-it-late-upstream
+# Quinto Gateway, con `KONG_TRUSTED_IPS` declarado, para simular el despliegue
+# detrás de Nginx Proxy Manager (ver "Rutas de US-09: detrás de un proxy").
+readonly GATEWAY_PROXY=vv-it-gateway-proxy
 readonly PACKAGE_NAME=ar.felaufernandezbottaro.vinculovial
 readonly JWT_ISSUER=vinculo-vial-identity
 
@@ -34,7 +52,9 @@ to_host_path() {
 failures=0
 
 cleanup() {
-  docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" >/dev/null 2>&1 || true
+  docker rm -f "${GATEWAY}" "${STUB}" "${UPSTREAM}" \
+    "${GATEWAY_SLOW}" "${SLOW_UPSTREAM}" "${GATEWAY_RESILIENCE}" "${FLAKY_UPSTREAM}" \
+    "${GATEWAY_PASSIVE}" "${LATE_UPSTREAM}" "${GATEWAY_PROXY}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -229,6 +249,79 @@ notifications_delete_status() {
       -H 'Content-Type: application/json' \
       --data-binary "${body}"
   fi
+}
+
+# Manda `METHOD path` con el Bearer token dado y devuelve el status HTTP. US-08:
+# el upstream de eco responde 200 a cualquier path, así que un 404 sólo puede
+# ser de Kong (ninguna Route matcheó): es lo que distingue "ruteado" de "no
+# ruteado" en la matriz de ruteo.
+route_status() {
+  local method="$1" path="$2" token="$3"
+
+  if [[ "${method}" == "GET" ]]; then
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X GET "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}"
+  else
+    docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary '{}'
+  fi
+}
+
+# Igual que `route_status`, pero devuelve los headers de la respuesta en
+# minúsculas. Sirve para identificar QUÉ Route atendió la request: cada una
+# declara un `rate-limiting` propio y Kong expone su límite en
+# `X-RateLimit-Limit-*` (`hide_client_headers: false`).
+route_headers() {
+  local method="$1" path="$2" token="$3"
+
+  if [[ "${method}" == "GET" ]]; then
+    docker exec "${GATEWAY}" curl -s -D - -o /dev/null \
+      -X GET "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" | tr '[:upper:]' '[:lower:]'
+  else
+    docker exec "${GATEWAY}" curl -s -D - -o /dev/null \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      --data-binary '{}' | tr '[:upper:]' '[:lower:]'
+  fi
+}
+
+# Manda un body de `bytes` bytes aleatorios (octet-stream) y devuelve el status
+# HTTP. El archivo se arma y se referencia dentro del contenedor, con un único
+# `sh -c`, para no chocar con el límite de argumentos del shell del host ni con
+# la conversión de rutas de Git Bash sobre `@/tmp/...`. El `; true` evita que
+# `set -e` aborte la suite si curl corta la subida ante un 413 temprano.
+sized_status() {
+  local method="$1" path="$2" token="$3" bytes="$4"
+
+  docker exec "${GATEWAY}" sh -c "
+    head -c ${bytes} /dev/urandom > /tmp/sized.bin
+    curl -s -o /dev/null -w '%{http_code}' -X ${method} 'http://127.0.0.1:8000${path}' \
+      -H 'Authorization: Bearer ${token}' \
+      -H 'Content-Type: application/octet-stream' -H 'Expect:' \
+      --data-binary @/tmp/sized.bin
+    true"
+}
+
+# Igual que `sized_status`, pero como el multipart de `POST /api/v1/alerts`
+# (US-08): una parte `metadata` JSON y una parte `general` de `bytes` bytes. El
+# Gateway no inspecciona ni valida el contenido: sólo cuenta el tamaño.
+multipart_status() {
+  local token="$1" bytes="$2"
+
+  docker exec "${GATEWAY}" sh -c "
+    printf '%s' '{\"attempt_id\":\"0f1e2d3c-4b5a-4968-8776-655443322110\",\"alert_type\":\"CRASHED\"}' > /tmp/meta.json
+    head -c ${bytes} /dev/urandom > /tmp/part.bin
+    curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/api/v1/alerts \
+      -H 'Authorization: Bearer ${token}' -H 'Expect:' \
+      -F 'metadata=@/tmp/meta.json;type=application/json' \
+      -F 'general=@/tmp/part.bin;type=application/octet-stream'
+    true"
 }
 
 # Firma un JWT RS256 compacto con la clave privada efímera de este run, usando
@@ -440,8 +533,39 @@ echo "Errores de Google"
 
 check "un token que Google rechaza se traduce en 403" \
   403 "$(signup_status "REJECT" '{}')"
-check "un error 5xx de Google falla cerrado" \
-  403 "$(signup_status "BOOM" '{}')"
+# Un 5xx de Google no es un veredicto negativo: es la dependencia caída.
+# Tratarlo como invalid_attestation le haría creer al cliente que SU
+# dispositivo es el problema, cuando en realidad es transitorio y ajeno a él.
+check "un error 5xx de Google se traduce en 502, no en un veredicto negativo" \
+  502 "$(signup_status "BOOM" '{}')"
+
+boom_rejection="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+  -H 'X-App-Attestation: BOOM' -d '{}')"
+
+check_contains "la falla de dependencia declara el error del contrato" \
+  '"error":"bad_gateway"' "${boom_rejection}"
+check_contains "la falla de dependencia declara el motivo público del contrato" \
+  '"reason":"dependency_error"' "${boom_rejection}"
+check_not_contains "la falla de dependencia no filtra el motivo interno" \
+  "playintegrity" "${boom_rejection}"
+
+# Google rechaza NUESTRO access token: defecto propio de configuración, no
+# un veredicto sobre el dispositivo del cliente ni Google caído. Expulsar al
+# cliente con un 403 acá es el bug que este caso fija como regresión.
+check "credenciales propias inválidas frente a Google se traducen en 500" \
+  500 "$(signup_status "UNAUTHORIZED" '{}')"
+
+unauthorized_rejection="$(docker exec "${GATEWAY}" curl -s \
+  -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+  -H 'X-App-Attestation: UNAUTHORIZED' -d '{}')"
+
+check_contains "el defecto propio declara el error del contrato" \
+  '"error":"internal_error"' "${unauthorized_rejection}"
+check_contains "el defecto propio declara el motivo público del contrato" \
+  '"reason":"gateway_fault"' "${unauthorized_rejection}"
+check_not_contains "el defecto propio no filtra el motivo interno" \
+  "playintegrity" "${unauthorized_rejection}"
 
 echo
 echo "Tamaño del payload"
@@ -767,6 +891,349 @@ check "/internal/resolve-owner no tiene Route: 404" \
     -d '{"pat_enc":"cripto-para-vehicle"}')"
 
 echo
+echo "Ruteo exacto (US-08): alerts-route y vehicles-route no capturan subrecursos"
+
+# Usuario dedicado: el cupo de `alerts-route` (5/min) es por X-User-Id, y USER_SUB
+# ya consumió parte del suyo más arriba.
+exact_user="6d7e8f90-a1b2-4c3d-8e4f-5a6b7c8d9e0f"
+exact_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${exact_user}\",\"exp\":$((now + 300))}")"
+exact_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+
+check "POST /api/v1/alerts sigue ruteando a alerts-route" \
+  200 "$(route_status POST /api/v1/alerts "${exact_token}")"
+check_contains "POST /api/v1/alerts lo atiende alerts-route (5/min, 10/h)" \
+  "x-ratelimit-limit-hour: 10" "$(route_headers POST /api/v1/alerts "${exact_token}")"
+
+check "POST /api/v1/alerts/ (barra final) ya no matchea alerts-route" \
+  404 "$(route_status POST /api/v1/alerts/ "${exact_token}")"
+check "POST /api/v1/alerts/{subrecurso} inexistente no cae en alerts-route" \
+  404 "$(route_status POST /api/v1/alerts/inexistente "${exact_token}")"
+check "POST /api/v1/alerts/{uuid} no cae en alerts-route" \
+  404 "$(route_status POST "/api/v1/alerts/${exact_uuid}" "${exact_token}")"
+
+check "GET /api/v1/alerts/inbox sigue ruteando a alerts-inbox-route" \
+  200 "$(route_status GET /api/v1/alerts/inbox "${exact_token}")"
+
+check "POST /api/v1/vehicles sigue ruteando a vehicles-route" \
+  200 "$(route_status POST /api/v1/vehicles "${exact_token}")"
+check "POST /api/v1/vehicles/ (barra final) ya no matchea vehicles-route" \
+  404 "$(route_status POST /api/v1/vehicles/ "${exact_token}")"
+check "POST /api/v1/vehicles/check (eliminado en US-08) ya no tiene Route" \
+  404 "$(route_status POST /api/v1/vehicles/check "${exact_token}")"
+
+echo
+echo "Rutas de US-08: matriz de ruteo"
+
+# Cada Route nueva declara un `rate-limiting` propio, y Kong expone su límite
+# en `X-RateLimit-Limit-*`: es lo que identifica QUÉ Route atendió.
+u8_user="3a4b5c6d-7e8f-4a9b-8c0d-1e2f3a4b5c6d"
+u8_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_user}\",\"exp\":$((now + 300))}")"
+u8_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+u8_evidence="/api/v1/alerts/${u8_uuid}/evidence"
+u8_feedback="/api/v1/alerts/${u8_uuid}/feedback"
+u8_report="/api/v1/alerts/${u8_uuid}/report"
+
+attempts_headers="$(route_headers POST /api/v1/alerts/attempts "${u8_token}")"
+check_contains "POST /api/v1/alerts/attempts → alerts-attempts-route (10/min)" \
+  "x-ratelimit-limit-minute: 10" "${attempts_headers}"
+check_contains "POST /api/v1/alerts/attempts → alerts-attempts-route (30/h)" \
+  "x-ratelimit-limit-hour: 30" "${attempts_headers}"
+
+check "GET /api/v1/alerts/{uuid}/evidence/PLATE/0 → alerts-evidence-route" \
+  200 "$(route_status GET "${u8_evidence}/PLATE/0" "${u8_token}")"
+for role in GENERAL PLATE DETAIL CONTEXT; do
+  check "GET .../evidence/${role}/2 rutea" \
+    200 "$(route_status GET "${u8_evidence}/${role}/2" "${u8_token}")"
+done
+check "GET .../evidence/FOO/0 (rol fuera del catálogo) → 404" \
+  404 "$(route_status GET "${u8_evidence}/FOO/0" "${u8_token}")"
+check "GET .../evidence/plate/0 (rol en minúsculas) → 404" \
+  404 "$(route_status GET "${u8_evidence}/plate/0" "${u8_token}")"
+check "GET .../evidence/PLATE/10 (índice de dos dígitos) → 404" \
+  404 "$(route_status GET "${u8_evidence}/PLATE/10" "${u8_token}")"
+check "GET .../evidence/PLATE/0/extra → 404" \
+  404 "$(route_status GET "${u8_evidence}/PLATE/0/extra" "${u8_token}")"
+check "GET /api/v1/alerts/{id corto}/evidence/PLATE/0 → 404" \
+  404 "$(route_status GET /api/v1/alerts/1234/evidence/PLATE/0 "${u8_token}")"
+check "POST .../evidence/PLATE/0 (método incorrecto) → 404" \
+  404 "$(route_status POST "${u8_evidence}/PLATE/0" "${u8_token}")"
+
+check_contains "PUT .../feedback → alerts-feedback-route (30/min)" \
+  "x-ratelimit-limit-minute: 30" "$(route_headers PUT "${u8_feedback}" "${u8_token}")"
+check "POST .../feedback (método incorrecto) → 404" \
+  404 "$(route_status POST "${u8_feedback}" "${u8_token}")"
+check "PUT /api/v1/alerts/{id corto}/feedback → 404" \
+  404 "$(route_status PUT /api/v1/alerts/1234/feedback "${u8_token}")"
+
+report_headers="$(route_headers POST "${u8_report}" "${u8_token}")"
+check_contains "POST .../report → alerts-report-route (5/min)" \
+  "x-ratelimit-limit-minute: 5" "${report_headers}"
+check_contains "POST .../report → alerts-report-route (20/h)" \
+  "x-ratelimit-limit-hour: 20" "${report_headers}"
+check "PUT .../report (método incorrecto) → 404" \
+  404 "$(route_status PUT "${u8_report}" "${u8_token}")"
+check "POST .../report/ (barra final) → 404" \
+  404 "$(route_status POST "${u8_report}/" "${u8_token}")"
+
+check "POST /api/v1/alerts sigue en alerts-route" \
+  200 "$(route_status POST /api/v1/alerts "${u8_token}")"
+check "GET /api/v1/alerts/inbox sigue en alerts-inbox-route" \
+  200 "$(route_status GET /api/v1/alerts/inbox "${u8_token}")"
+check "POST /api/v1/vehicles sigue en vehicles-route" \
+  200 "$(route_status POST /api/v1/vehicles "${u8_token}")"
+check "POST /api/v1/vehicles/check → 404" \
+  404 "$(route_status POST /api/v1/vehicles/check "${u8_token}")"
+
+echo
+echo "Rutas de US-08: seguridad (JWT y Token Offloading)"
+
+u8_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_user}\",\"exp\":$((now - 300))}")"
+for target in "POST /api/v1/alerts/attempts" "GET ${u8_evidence}/PLATE/0" \
+  "PUT ${u8_feedback}" "POST ${u8_report}"; do
+  method="${target%% *}"; path="${target#* }"
+
+  check "sin Authorization, 401: ${method} ${path##*/}" \
+    401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}" \
+      -H 'Content-Type: application/json' -d '{}')"
+  check "JWT expirado, 401: ${method} ${path##*/}" \
+    401 "$(route_status "${method}" "${path}" "${u8_expired}")"
+
+  spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u8_token}" \
+    -H 'X-User-Id: usuario-suplantado' \
+    -H 'Content-Type: application/json' -d '{}' | tr '[:upper:]' '[:lower:]')"
+  check_contains "X-User-Id del JWT llega al upstream: ${method} ${path##*/}" \
+    "\"x-user-id\": \"${u8_user}\"" "${spoofed_view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${method} ${path##*/}" \
+    "usuario-suplantado" "${spoofed_view}"
+  check_not_contains "el Authorization no se propaga: ${method} ${path##*/}" \
+    "authorization" "${spoofed_view}"
+done
+
+echo
+echo "Rutas de US-08: límites de tamaño"
+
+u8_size_user="5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f"
+u8_size_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u8_size_user}\",\"exp\":$((now + 300))}")"
+
+# `alerts-route`: 5 MB = 5242880 bytes. 5,1 MB (5347738) se rechaza; 4,8 MB
+# (5033165) pasa. El 413 de Kong no gasta cupo de rate limit.
+check "multipart de 5,1 MB → 413" \
+  413 "$(multipart_status "${u8_size_token}" 5347738)"
+check "multipart de 4,8 MB pasa" \
+  200 "$(multipart_status "${u8_size_token}" 5033165)"
+
+check "attempts de 9000 bytes (> 8 KB) → 413" \
+  413 "$(sized_status POST /api/v1/alerts/attempts "${u8_size_token}" 9000)"
+check "attempts de 7000 bytes (≤ 8 KB) pasa" \
+  200 "$(sized_status POST /api/v1/alerts/attempts "${u8_size_token}" 7000)"
+check "feedback de 1500 bytes (> 1 KB) → 413" \
+  413 "$(sized_status PUT "${u8_feedback}" "${u8_size_token}" 1500)"
+check "feedback de 900 bytes (≤ 1 KB) pasa" \
+  200 "$(sized_status PUT "${u8_feedback}" "${u8_size_token}" 900)"
+check "report de 1500 bytes (> 1 KB) → 413" \
+  413 "$(sized_status POST "${u8_report}" "${u8_size_token}" 1500)"
+check "report de 900 bytes (≤ 1 KB) pasa" \
+  200 "$(sized_status POST "${u8_report}" "${u8_size_token}" 900)"
+
+echo
+echo "Rutas de US-08: rate limiting por X-User-Id"
+
+# Mismo guard de reloj que el de /alerts/inbox: el contador `local` usa una
+# ventana fija alineada al minuto de reloj; si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado.
+u8_rl_seconds="$(date +%S)"; u8_rl_seconds=$((10#${u8_rl_seconds}))
+if (( u8_rl_seconds > 30 )); then
+  u8_rl_sleep=$((60 - u8_rl_seconds))
+  echo "  (esperando ${u8_rl_sleep}s al próximo minuto de reloj, para no cruzar la ventana del rate-limiting a mitad de la ráfaga)"
+  sleep "${u8_rl_sleep}"
+fi
+
+u8_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d\",\"exp\":$((now + 300))}")"
+u8_rl_other="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"8b9c0d1e-2f3a-4b4c-9d5e-6f7a8b9c0d1e\",\"exp\":$((now + 300))}")"
+
+for _ in $(seq 1 9); do
+  route_status POST /api/v1/alerts/attempts "${u8_rl_token}" >/dev/null
+done
+check "el attempt 10 del minuto todavía pasa" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_token}")"
+check "el attempt 11 del minuto → 429" \
+  429 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_token}")"
+check "otro usuario no comparte el contador de attempts" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u8_rl_other}")"
+
+for _ in $(seq 1 4); do
+  route_status POST "${u8_report}" "${u8_rl_token}" >/dev/null
+done
+check "el report 5 del minuto todavía pasa" \
+  200 "$(route_status POST "${u8_report}" "${u8_rl_token}")"
+check "el report 6 del minuto → 429" \
+  429 "$(route_status POST "${u8_report}" "${u8_rl_token}")"
+check "otro usuario no comparte el contador de report" \
+  200 "$(route_status POST "${u8_report}" "${u8_rl_other}")"
+
+echo
+echo "Rutas de US-09: matriz de ruteo (alerts-sent-route y alerts-seen-route)"
+
+# El upstream de eco responde 200 a todo (incluido el PUT .../seen, que en
+# Alert devuelve 204): acá sólo se verifica QUÉ Route atiende cada request, no
+# el status del servicio real.
+u9_user="2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
+u9_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u9_user}\",\"exp\":$((now + 300))}")"
+u9_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u9_user}\",\"exp\":$((now - 300))}")"
+u9_uuid="0f1e2d3c-4b5a-4968-8776-655443322110"
+u9_sent="/api/v1/alerts/sent"
+u9_seen="/api/v1/alerts/${u9_uuid}/seen"
+
+check "GET /api/v1/alerts/sent → alerts-sent-route" \
+  200 "$(route_status GET "${u9_sent}" "${u9_token}")"
+check_contains "GET /api/v1/alerts/sent lo atiende alerts-sent-route (20/min)" \
+  "x-ratelimit-limit-minute: 20" "$(route_headers GET "${u9_sent}" "${u9_token}")"
+check "GET /api/v1/alerts/sent con limit y cursor rutea igual" \
+  200 "$(route_status GET "${u9_sent}?limit=50&cursor=abc" "${u9_token}")"
+check "POST /api/v1/alerts/sent (método incorrecto) → 404" \
+  404 "$(route_status POST "${u9_sent}" "${u9_token}")"
+check "GET /api/v1/alerts/sent/ (barra final) → 404" \
+  404 "$(route_status GET "${u9_sent}/" "${u9_token}")"
+check "GET /api/v1/alerts/sentinel (mismo prefijo) → 404" \
+  404 "$(route_status GET /api/v1/alerts/sentinel "${u9_token}")"
+check "GET /api/v1/alerts/sent/{uuid} → 404" \
+  404 "$(route_status GET "${u9_sent}/${u9_uuid}" "${u9_token}")"
+
+u9_seen_headers="$(route_headers PUT "${u9_seen}" "${u9_token}")"
+check "PUT /api/v1/alerts/{uuid}/seen → alerts-seen-route" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_token}")"
+check_contains "PUT .../seen lo atiende alerts-seen-route (30/min)" \
+  "x-ratelimit-limit-minute: 30" "${u9_seen_headers}"
+check "POST .../seen (método incorrecto) → 404" \
+  404 "$(route_status POST "${u9_seen}" "${u9_token}")"
+check "GET .../seen (método incorrecto) → 404" \
+  404 "$(route_status GET "${u9_seen}" "${u9_token}")"
+check "PUT /api/v1/alerts/{id corto}/seen → 404" \
+  404 "$(route_status PUT /api/v1/alerts/1234/seen "${u9_token}")"
+check "PUT .../seen/ (barra final) → 404" \
+  404 "$(route_status PUT "${u9_seen}/" "${u9_token}")"
+check "PUT .../seen/extra → 404" \
+  404 "$(route_status PUT "${u9_seen}/extra" "${u9_token}")"
+
+# Ninguna Route existente captura los paths nuevos, ni al revés: cada una sigue
+# atendiendo lo suyo.
+check_contains "POST /api/v1/alerts sigue en alerts-route (5/min, 10/h)" \
+  "x-ratelimit-limit-hour: 10" "$(route_headers POST /api/v1/alerts "${u9_token}")"
+check_contains "GET /api/v1/alerts/inbox sigue en alerts-inbox-route (20/min, sin hora)" \
+  "x-ratelimit-limit-minute: 20" "$(route_headers GET /api/v1/alerts/inbox "${u9_token}")"
+check "POST /api/v1/alerts/attempts sigue en alerts-attempts-route" \
+  200 "$(route_status POST /api/v1/alerts/attempts "${u9_token}")"
+check "PUT .../feedback sigue en alerts-feedback-route" \
+  200 "$(route_status PUT "/api/v1/alerts/${u9_uuid}/feedback" "${u9_token}")"
+check "POST .../report sigue en alerts-report-route" \
+  200 "$(route_status POST "/api/v1/alerts/${u9_uuid}/report" "${u9_token}")"
+
+echo
+echo "Rutas de US-09: seguridad (JWT y Token Offloading)"
+
+for target in "GET ${u9_sent}" "PUT ${u9_seen}"; do
+  method="${target%% *}"; path="${target#* }"
+
+  check "sin Authorization, 401: ${method} ${path##*/}" \
+    401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}")"
+  check "JWT expirado, 401: ${method} ${path##*/}" \
+    401 "$(route_status "${method}" "${path}" "${u9_expired}")"
+
+  u9_spoofed_view="$(docker exec "${GATEWAY}" curl -s \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u9_token}" \
+    -H 'X-User-Id: usuario-suplantado' | tr '[:upper:]' '[:lower:]')"
+  check_contains "X-User-Id del JWT llega al upstream: ${method} ${path##*/}" \
+    "\"x-user-id\": \"${u9_user}\"" "${u9_spoofed_view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${method} ${path##*/}" \
+    "usuario-suplantado" "${u9_spoofed_view}"
+  check_not_contains "el Authorization no se propaga: ${method} ${path##*/}" \
+    "authorization" "${u9_spoofed_view}"
+done
+
+echo
+echo "Rutas de US-09: rate limiting por X-User-Id (sent 20/min, seen 30/min)"
+
+# Mismo guard de reloj que el de /alerts/inbox: la ventana fija del contador
+# `local` se alinea al minuto de reloj y, si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado. Cada ráfaga espera por su
+# cuenta (`$1` = segundos máximos que puede pasar del minuto de reloj al
+# arrancar), porque juntas no entran en un mismo minuto.
+u9_wait_clock_minute() {
+  local now_seconds
+  now_seconds="$(date +%S)"; now_seconds=$((10#${now_seconds}))
+  if (( now_seconds > $1 )); then
+    echo "  (esperando $((60 - now_seconds))s al próximo minuto de reloj, para no cruzar la ventana del rate-limiting a mitad de la ráfaga)"
+    sleep $((60 - now_seconds))
+  fi
+}
+
+u9_wait_clock_minute 25
+
+u9_rl_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a\",\"exp\":$((now + 300))}")"
+u9_rl_other="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b\",\"exp\":$((now + 300))}")"
+
+# Si un GET a /alerts/sent cayera en `alerts-route` (5/min), esta ráfaga habría
+# fallado mucho antes del vigésimo.
+for _ in $(seq 1 19); do
+  route_status GET "${u9_sent}" "${u9_rl_token}" >/dev/null
+done
+check "el request 20 de sent en el minuto todavía pasa" \
+  200 "$(route_status GET "${u9_sent}" "${u9_rl_token}")"
+check "el request 21 de sent en el minuto → 429" \
+  429 "$(route_status GET "${u9_sent}" "${u9_rl_token}")"
+check "otro usuario no comparte el contador de sent" \
+  200 "$(route_status GET "${u9_sent}" "${u9_rl_other}")"
+
+u9_wait_clock_minute 15
+for _ in $(seq 1 29); do
+  route_status PUT "${u9_seen}" "${u9_rl_token}" >/dev/null
+done
+check "el request 30 de seen en el minuto todavía pasa" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_rl_token}")"
+check "el request 31 de seen en el minuto → 429" \
+  429 "$(route_status PUT "${u9_seen}" "${u9_rl_token}")"
+check "otro usuario no comparte el contador de seen" \
+  200 "$(route_status PUT "${u9_seen}" "${u9_rl_other}")"
+
+echo
+echo "Rutas de US-09: detrás de un proxy (KONG_TRUSTED_IPS)"
+
+# Nginx Proxy Manager termina el TLS delante de Kong y reenvía la IP real en
+# `X-Forwarded-For`. El proxy se simula con el propio curl dentro del
+# contenedor: su peer es 127.0.0.1, que es lo que se declara de confianza.
+# Con la lista vacía (el Gateway principal) el header del cliente se ignora.
+echo "==> Levantando un Gateway con KONG_TRUSTED_IPS"
+docker run -d --name "${GATEWAY_PROXY}" --network "${NETWORK}"   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")"   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro"   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080"   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080"   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080"   -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080"   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080"   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}"   -e ATTESTATION_SOURCE=google   -e ATTESTATION_SSL_VERIFY=false   -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}"   -e "JWT_ISSUER=${JWT_ISSUER}"   -e "KONG_TRUSTED_IPS=127.0.0.1/32"   vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_PROXY}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_PROXY}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El Gateway con KONG_TRUSTED_IPS no llegó a estar healthy:"
+  docker logs "${GATEWAY_PROXY}"
+  exit 1
+fi
+
+u9_proxy_headers=(-H "Authorization: Bearer ${u9_token}" -H 'X-Forwarded-For: 203.0.113.7')
+u9_proxy_view="$(docker exec "${GATEWAY_PROXY}" curl -s   -X GET "http://127.0.0.1:8000${u9_sent}" "${u9_proxy_headers[@]}" | tr '[:upper:]' '[:lower:]')"
+check_contains "con proxy de confianza, Kong toma la IP real del X-Forwarded-For (sent)"   "\"x-real-ip\": \"203.0.113.7\"" "${u9_proxy_view}"
+check_contains "con proxy de confianza, X-User-Id sigue llegando del JWT (sent)"   "\"x-user-id\": \"${u9_user}\"" "${u9_proxy_view}"
+check "con proxy de confianza, PUT .../seen sigue ruteando"   200 "$(docker exec "${GATEWAY_PROXY}" curl -s -o /dev/null -w '%{http_code}'     -X PUT "http://127.0.0.1:8000${u9_seen}" "${u9_proxy_headers[@]}")"
+check "con proxy de confianza, sin JWT sigue siendo 401"   401 "$(docker exec "${GATEWAY_PROXY}" curl -s -o /dev/null -w '%{http_code}'     -X GET "http://127.0.0.1:8000${u9_sent}" -H 'X-Forwarded-For: 203.0.113.7')"
+
+u9_direct_view="$(docker exec "${GATEWAY}" curl -s   -X GET "http://127.0.0.1:8000${u9_sent}" "${u9_proxy_headers[@]}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "sin proxy de confianza, el X-Forwarded-For del cliente se ignora"   "\"x-real-ip\": \"203.0.113.7\"" "${u9_direct_view}"
+
+echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
 
 # Mismo usuario que en las secciones anteriores: el rate-limiting de esta
@@ -998,6 +1465,455 @@ check "quince DELETE seguidos del mismo usuario pasan todos (0 con status distin
 # compartido entre Routes) todavía tiene que pasar.
 check "el alta (POST) sigue funcionando para ese usuario tras la ráfaga de bajas" \
   200 "$(notifications_post_status "${del_rl_token}" "${notif_body}")"
+
+echo
+echo "Resiliencia (K2): reintentos de Kong ante un upstream interno lento"
+
+# Gateway y upstream dedicados, aislados del resto de la suite: ninguno de los
+# tres Services restantes se ejercita acá, así que apuntan a destinos
+# inválidos, mismo patrón que usa el job "Configuración declarativa" de CI.
+# Reutiliza el par JWT ya generado (jwt_public_key_escaped / sign_jwt): no
+# hace falta uno nuevo para que este Gateway acepte valid_token-equivalentes.
+echo "==> Levantando un upstream deliberadamente lento"
+docker run -d --name "${SLOW_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/slow-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/slow/logs && exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/slow -g "daemon off;"' \
+  >/dev/null
+
+echo "==> Levantando un segundo Gateway para la prueba de timeout/reintentos"
+docker run -d --name "${GATEWAY_SLOW}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${SLOW_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_SLOW}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_SLOW}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El segundo Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_SLOW}"
+  exit 1
+fi
+
+slow_user="5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"
+slow_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${slow_user}\",\"exp\":$((now + 300))}")"
+
+timeout_status="$(docker exec "${GATEWAY_SLOW}" curl -s -o /dev/null -w '%{http_code}' \
+  -X POST http://127.0.0.1:8000/api/v1/notifications/tokens \
+  -H "Authorization: Bearer ${slow_token}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "${notif_body}")"
+
+# Comportamiento nativo de Kong ante un timeout de upstream interno: 504, no
+# 503. El contrato de resiliencia de la plataforma reserva esa diferencia
+# deliberadamente para este caso (ver README).
+check "un upstream que no responde dentro de read_timeout corta con 504" \
+  504 "${timeout_status}"
+
+slow_invocations="$(docker logs "${SLOW_UPSTREAM}" 2>&1 \
+  | grep -c 'slow-upstream: invocacion recibida' || true)"
+check "el upstream lento recibe exactamente 1 invocación pese a retries: 1" \
+  1 "${slow_invocations}"
+
+echo
+echo "Resiliencia (Ola 5): presupuesto de las llamadas a Google y salud de los upstreams"
+
+# Tercer Gateway, fresco (sin access token de Google en caché, que es lo que
+# permite medir el reparto del presupuesto entre el canje de OAuth y
+# decodeIntegrityToken) y con el healthcheck activo acelerado: con los valores
+# por defecto (10s de intervalo, 3 fallas) sacar un target del balanceo tardaría
+# cerca de medio minuto. Sólo notification-service apunta a un upstream real
+# (el controlable); los otros tres, a destinos inválidos como en la sección
+# anterior.
+echo "==> Levantando un upstream controlable"
+docker run -d --name "${FLAKY_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/flaky-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/flaky/logs && exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/flaky -g "daemon off;"' \
+  >/dev/null
+
+echo "==> Levantando un tercer Gateway para la prueba de resiliencia"
+docker run -d --name "${GATEWAY_RESILIENCE}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD=1 \
+  -e UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD=2 \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_RESILIENCE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_RESILIENCE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El tercer Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_RESILIENCE}"
+  exit 1
+fi
+
+# Un signup contra el tercer Gateway con el token de atestación dado. Imprime
+# el body, un salto de línea, y "<status> <segundos>". El tiempo lo mide curl
+# dentro del contenedor: no incluye el costo de `docker exec`.
+resilience_signup_timed() {
+  docker exec "${GATEWAY_RESILIENCE}" curl -s \
+    -w '\n%{http_code} %{time_total}' \
+    -X POST http://127.0.0.1:8000/api/v1/auth/signup \
+    -H "X-App-Attestation: $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+# "dentro" si el valor cae en [mínimo, máximo], "fuera (<valor>s)" si no.
+in_range() {
+  awk -v t="$1" -v lo="$2" -v hi="$3" \
+    'BEGIN { print (t >= lo && t <= hi) ? "dentro" : "fuera (" t "s)" }'
+}
+
+resilience_delete_status() {
+  docker exec "${GATEWAY_RESILIENCE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE http://127.0.0.1:8000/api/v1/notifications/tokens \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+flaky_control() {
+  docker exec "${GATEWAY}" curl -s -o /dev/null "http://${FLAKY_UPSTREAM}:8080/control?$1"
+}
+
+flaky_invocations() {
+  docker logs "${FLAKY_UPSTREAM}" 2>&1 | grep -c 'flaky-upstream: invocacion recibida' || true
+}
+
+echo
+echo "Presupuesto agregado de Google (OAuth + decodeIntegrityToken)"
+
+# Con el canje de OAuth demorado 2500ms (dentro de su techo de 3000) y Play
+# Integrity colgado, el par tiene que cortar a los 4000ms del agregado: la
+# segunda llamada recibe los 1500ms que quedan, no una ventana nueva de 3000
+# (que daría ~5500ms). El piso de 3.8s verifica además que la demora del
+# stub se aplicó: sin ella, Play Integrity cortaría solo a los 3000ms.
+docker exec "${GATEWAY}" curl -s -o /dev/null "http://${STUB}:8080/control/token-delay?ms=2500"
+
+budget_out="$(resilience_signup_timed SLOW)"
+budget_body="${budget_out%$'\n'*}"
+read -r budget_status budget_secs <<< "${budget_out##*$'\n'}"
+
+docker exec "${GATEWAY}" curl -s -o /dev/null "http://${STUB}:8080/control/token-delay?ms=0"
+
+check "un canje de OAuth lento y un decodeIntegrityToken colgado se traducen en 503" \
+  503 "${budget_status}"
+check_contains "la respuesta declara el error del contrato" \
+  '"error":"service_unavailable"' "${budget_body}"
+check_contains "la respuesta declara el motivo público del contrato" \
+  '"reason":"dependency_unavailable"' "${budget_body}"
+check "el par corta a los 4000ms del agregado, no a 2500+3000 (entre 3.8s y 4.6s)" \
+  dentro "$(in_range "${budget_secs}" 3.8 4.6)"
+
+# El access token quedó en caché por el canje anterior: ahora Play Integrity
+# dispone del techo por llamada completo, y corta ahí.
+timeout_out="$(resilience_signup_timed SLOW)"
+timeout_body="${timeout_out%$'\n'*}"
+read -r timeout_status timeout_secs <<< "${timeout_out##*$'\n'}"
+
+check "con el access token en caché, un decodeIntegrityToken colgado se traduce en 503" \
+  503 "${timeout_status}"
+check_contains "la respuesta declara el motivo público del contrato" \
+  '"reason":"dependency_unavailable"' "${timeout_body}"
+check "corta en el techo por llamada de 3000ms, nunca una espera indefinida (entre 2.8s y 3.6s)" \
+  dentro "$(in_range "${timeout_secs}" 2.8 3.6)"
+
+echo
+echo "Balanceo: un upstream que responde 5xx o 4xx sigue en el balanceo"
+
+# Lo único que decide si una instancia está en el balanceo es /ready
+# (healthcheck activo). El pasivo no cuenta el status HTTP: un 503 emitido
+# por el servicio es contención por ruta (una dependencia caída detrás de su
+# propio breaker), y si sacara a la instancia entera se caerían también las
+# rutas que sí funcionan. DELETE /notifications/tokens no tiene
+# rate-limiting, así que alcanza con un usuario para toda la sección.
+res_now="$(date +%s)"
+res_user="8e9f0a1b-2c3d-4e4f-9a5b-6c7d8e9f0a1b"
+res_token="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${res_user}\",\"exp\":$((res_now + 300))}")"
+
+flaky_control "ready=200&business=503"
+upstream_before="$(flaky_invocations)"
+
+# Diez, muy por encima del umbral de 2 de este Gateway. Las últimas dos van
+# después de tres intervalos del healthcheck activo: si el pasivo contara
+# HTTP, el target ya habría salido del balanceo.
+not_503=0
+for _ in $(seq 1 8); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || not_503=$((not_503 + 1))
+done
+sleep 3
+for _ in $(seq 1 2); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || not_503=$((not_503 + 1))
+done
+
+check "diez 503 repetidos del upstream se reenvían tal cual (0 con status distinto)" \
+  0 "${not_503}"
+check "ninguno lo emitió el balanceador: el upstream recibió las diez" \
+  10 "$(( $(flaky_invocations) - upstream_before ))"
+
+# Un 4xx tampoco cuenta: es responsabilidad del cliente, no una falla del
+# upstream.
+flaky_control "business=400"
+upstream_before="$(flaky_invocations)"
+
+not_400=0
+for _ in $(seq 1 5); do
+  [[ "$(resilience_delete_status "${res_token}")" == "400" ]] || not_400=$((not_400 + 1))
+done
+
+check "cinco 4xx repetidos del upstream se reenvían tal cual (0 con status distinto)" \
+  0 "${not_400}"
+check "el upstream recibió las cinco: un 4xx no abre el circuito" \
+  5 "$(( $(flaky_invocations) - upstream_before ))"
+
+echo
+echo "Balanceo: un target con /ready no sano sale del balanceo (503 sin tocar la red)"
+
+# Las rutas de negocio siguen respondiendo 400: cualquier 503 a partir de acá
+# sólo puede venir del balanceador, no del upstream.
+flaky_control "ready=503"
+
+balancer_status=""
+for _ in $(seq 1 30); do
+  balancer_status="$(resilience_delete_status "${res_token}")"
+  if [[ "${balancer_status}" == "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "con /ready no sano, el balanceador responde 503" 503 "${balancer_status}"
+
+upstream_before="$(flaky_invocations)"
+
+open_not_503=0
+for _ in $(seq 1 5); do
+  [[ "$(resilience_delete_status "${res_token}")" == "503" ]] || open_not_503=$((open_not_503 + 1))
+done
+
+check "con el circuito abierto, cada request recibe 503 (0 con status distinto)" \
+  0 "${open_not_503}"
+check "con el circuito abierto, ninguna request llega al upstream" \
+  "${upstream_before}" "$(flaky_invocations)"
+
+echo
+echo "Recuperación: un target no sano vuelve al balanceo cuando /ready se recupera"
+
+# Sin esto, un `unhealthy.interval` en 0 deja el target fuera para siempre:
+# Kong no vuelve a sondearlo, y un corte breve de la base propia del servicio
+# lo saca del balanceo de forma permanente. Las rutas de negocio siguen
+# respondiendo 400, así que un 400 sólo puede venir del upstream: es la
+# prueba de que la request volvió a llegar.
+flaky_control "ready=200"
+
+recovered_status=""
+for _ in $(seq 1 30); do
+  recovered_status="$(resilience_delete_status "${res_token}")"
+  if [[ "${recovered_status}" != "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al recuperarse /ready, el target marcado por el activo vuelve al balanceo" \
+  400 "${recovered_status}"
+
+echo
+echo "Recuperación: targets marcados por el healthcheck pasivo (timeouts y errores de conexión)"
+
+# Cuarto Gateway, con el sondeo de targets SANOS apagado (healthy.interval = 0):
+# sin él, el activo marcaría el target al instante y no habría forma de
+# distinguir quién lo sacó del balanceo. Así sólo el pasivo puede hacerlo, y
+# el activo (unhealthy.interval, 1s) queda como único camino de regreso. Que
+# la primera request llegue al upstream aunque /ready ya esté no sano es la
+# verificación de ese aislamiento. Fuera de la suite ese 0 no está permitido:
+# el Gateway sólo lo acepta con GATEWAY_TEST_MODE=true (ver la guardia de
+# arranque, más abajo).
+echo "==> Levantando un upstream con el puerto cerrado"
+docker run -d --name "${LATE_UPSTREAM}" --network "${NETWORK}" \
+  -v "$(to_host_path "${SCRIPT_DIR}/flaky-upstream/nginx.conf"):/conf/nginx.conf:ro" \
+  --entrypoint sh kong:3.7 \
+  -c 'mkdir -p /tmp/flaky/logs && exec sleep infinity' \
+  >/dev/null
+
+echo "==> Levantando un cuarto Gateway para la prueba del healthcheck pasivo"
+docker run -d --name "${GATEWAY_PASSIVE}" --network "${NETWORK}" \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro" \
+  -e "IDENTITY_SERVICE_URL=http://identity.invalid:8080" \
+  -e "VEHICLE_SERVICE_URL=http://${LATE_UPSTREAM}:8080" \
+  -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
+  -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
+  -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
+  -e ATTESTATION_SOURCE=google \
+  -e ATTESTATION_SSL_VERIFY=false \
+  -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}" \
+  -e "JWT_ISSUER=${JWT_ISSUER}" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 \
+  -e GATEWAY_TEST_MODE=true \
+  -e UPSTREAM_HEALTHCHECK_TIMEOUT_SECONDS=1 \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_THRESHOLD=1 \
+  -e UPSTREAM_HEALTHCHECK_UNHEALTHY_THRESHOLD=2 \
+  vinculo-vial-gateway:integration >/dev/null
+
+for _ in $(seq 1 30); do
+  if docker exec "${GATEWAY_PASSIVE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker exec "${GATEWAY_PASSIVE}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
+  echo "El cuarto Gateway no llegó a estar healthy:"
+  docker logs "${GATEWAY_PASSIVE}"
+  exit 1
+fi
+
+passive_delete_status() {
+  docker exec "${GATEWAY_PASSIVE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE http://127.0.0.1:8000/api/v1/notifications/tokens \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+passive_vehicles_status() {
+  docker exec "${GATEWAY_PASSIVE}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8000/api/v1/vehicles \
+    -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}'
+}
+
+# Timeouts: el upstream demora 12000ms (el read_timeout de notification-service
+# es de 9000) y /ready ya está no sano. Dos requests en paralelo alcanzan el
+# umbral de 2 timeouts en un solo read_timeout.
+flaky_control "ready=503&business=200&delay=12000"
+
+timeout_file_1="$(mktemp)"
+timeout_file_2="$(mktemp)"
+passive_delete_status "${res_token}" > "${timeout_file_1}" &
+timeout_pid_1=$!
+passive_delete_status "${res_token}" > "${timeout_file_2}" &
+timeout_pid_2=$!
+wait "${timeout_pid_1}"
+wait "${timeout_pid_2}"
+
+check "con /ready no sano pero sin sondeo de targets sanos, la request llega al upstream y corta por timeout (504)" \
+  504 "$(cat "${timeout_file_1}")"
+check "la segunda request en paralelo también corta por timeout (504)" \
+  504 "$(cat "${timeout_file_2}")"
+rm -f "${timeout_file_1}" "${timeout_file_2}"
+
+# /ready sigue no sano, así que el activo no lo devuelve todavía: el 503 sólo
+# puede ser la marca del pasivo.
+check "los timeouts marcan el target como no sano: 503 del balanceador" \
+  503 "$(passive_delete_status "${res_token}")"
+
+flaky_control "ready=200&delay=0"
+
+passive_timeout_recovered=""
+for _ in $(seq 1 30); do
+  passive_timeout_recovered="$(passive_delete_status "${res_token}")"
+  if [[ "${passive_timeout_recovered}" != "503" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al recuperarse /ready, el target marcado por timeouts vuelve al balanceo" \
+  200 "${passive_timeout_recovered}"
+
+# Errores de conexión: vehicle-service apunta a un contenedor que existe pero
+# no tiene nada escuchando (conexión rechazada). Por el mismo motivo que arriba,
+# la primera request llega al upstream y falla por conexión (502). Kong le
+# reporta al pasivo un solo fallo por request (el final, no cada reintento),
+# así que el umbral de 2 lo cruza la segunda request, que todavía recibe 502:
+# el 503 del balanceador recién llega en la tercera.
+check "con el puerto cerrado, la request falla por conexión (502) y no por el balanceador" \
+  502 "$(passive_vehicles_status "${res_token}")"
+check "la segunda falla por conexión también (502): cruza el umbral de 2" \
+  502 "$(passive_vehicles_status "${res_token}")"
+check "los errores de conexión marcan el target como no sano: 503 del balanceador" \
+  503 "$(passive_vehicles_status "${res_token}")"
+
+# El upstream empieza a escuchar: el activo lo detecta y lo devuelve.
+docker exec -d "${LATE_UPSTREAM}" sh -c \
+  'exec /usr/local/openresty/bin/openresty -c /conf/nginx.conf -p /tmp/flaky -g "daemon off;"'
+
+passive_tcp_recovered=""
+for _ in $(seq 1 30); do
+  passive_tcp_recovered="$(passive_vehicles_status "${res_token}")"
+  if [[ "${passive_tcp_recovered}" == "200" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+check "al empezar a escuchar el puerto, el target marcado por errores de conexión vuelve al balanceo" \
+  200 "${passive_tcp_recovered}"
+
+echo
+echo "Guardia de arranque: los intervalos de sondeo no pueden ser 0"
+
+guard_output="$(docker run --rm \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -e UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=0 \
+  vinculo-vial-gateway:integration 2>&1 || true)"
+
+check_contains "con UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS=0 el Gateway no arranca" \
+  "UPSTREAM_HEALTHCHECK_INTERVAL_SECONDS debe ser un entero positivo" "${guard_output}"
+
+# Con 0 en el intervalo de targets sanos, el activo no los sondea y un
+# servicio con la base caída que sigue respondiendo 503 nunca saldría del
+# balanceo. Sólo se permite declarando el modo test, que la suite usa para
+# aislar el pasivo (cuarto Gateway, más arriba).
+healthy_guard_output="$(docker run --rm \
+  --env-file "$(to_host_path "${REPO_ROOT}/.env.example")" \
+  -e UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 \
+  vinculo-vial-gateway:integration 2>&1 || true)"
+
+check_contains "con UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS=0 el Gateway no arranca" \
+  "UPSTREAM_HEALTHCHECK_HEALTHY_INTERVAL_SECONDS debe ser mayor que 0" "${healthy_guard_output}"
+
+check_contains "con GATEWAY_TEST_MODE=true el Gateway acepta ese 0 y lo avisa por WARN" \
+  "WARN: GATEWAY_TEST_MODE=true" "$(docker logs "${GATEWAY_PASSIVE}" 2>&1)"
 
 echo
 if (( failures > 0 )); then
