@@ -10,8 +10,9 @@ Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
 /api/v1/vehicles` (US-04, Vinculación de Vehículo) hacia
 `vinculo-vial-vehicle`, `POST /api/v1/alerts` (US-05, Escaneo de Patente y
 Alerta Anónima) + `GET /api/v1/alerts/inbox` (US-07, Buzón de Alertas) hacia
-`vinculo-vial-alert`, y `POST` + `DELETE /api/v1/notifications/tokens` (US-06,
-Registro y Baja de Tokens FCM) hacia `vinculo-vial-notification`. Valida **App
+`vinculo-vial-alert`, `POST` + `DELETE /api/v1/notifications/tokens` (US-06,
+Registro y Baja de Tokens FCM) hacia `vinculo-vial-notification`, y `DELETE
+/api/v1/users/me` (US-11, Baja de Cuenta) hacia `vinculo-vial-identity`. Valida **App
 Attestation** (`X-App-Attestation`, contra Google Play Integrity) en signup,
 signin y refresh antes de permitir tráfico hacia la red interna — **logout es
 la única excepción deliberada** (ver más abajo). El resto de las Routes usa un
@@ -21,6 +22,7 @@ upstream nunca vea ni necesite validar el JWT. Ninguna tiene `app-attestation`
 (decisión cerrada del contrato desde US-05, por velocidad) y las que escriben
 datos se apoyan en cambio en **rate limiting por usuario** sobre `X-User-Id`
 — 5/min y 10/hora en `/alerts`, 10/día en el alta de `/notifications/tokens`,
+3/min y 10/hora en la baja de cuenta (`DELETE /users/me`),
 como control de seguridad y no como cortesía operativa; 20/min en
 `/alerts/inbox`, más permisivo por tratarse de lectura idempotente. La baja de
 `/notifications/tokens` **no** lleva rate limiting, deliberadamente (ver más
@@ -28,8 +30,10 @@ abajo). El body de signup/signin/vehicles/alerts viaja cifrado extremo a
 extremo (HPKE) y el Gateway nunca lo inspecciona ni lo modifica; el de
 refresh/logout es un Refresh Token opaco sin cifrado propio, cuya
 confidencialidad la aporta HTTPS; el del alta de `/notifications/tokens` es
-un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
-`/notifications/tokens` no tienen body relevante.
+un token FCM en texto plano, sin cifrado propio; el de `DELETE /users/me` es
+`{ "password": "<string>" }`, también sin cifrado propio y con su confidencialidad
+en HTTPS (el Gateway no lo inspecciona ni lo loguea); `/alerts/inbox` y la baja
+de `/notifications/tokens` no tienen body relevante.
 
 ## Estado
 
@@ -46,13 +50,14 @@ un token FCM en texto plano, sin cifrado propio; `/alerts/inbox` y la baja de
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
 | Ruteo y rate limiting por usuario en `/alerts/sent` (20/min) y `PUT /alerts/{uuid}/seen` (30/min), US-09 | ✅ |
+| Ruteo, límite de tamaño (1 KB) y rate limiting por usuario (3/min, 10/hora) en `DELETE /users/me`, US-11 | ✅ |
 | Rate limiting por usuario en el alta de `/notifications/tokens` (10/día sobre `X-User-Id`) | ✅ |
 | La baja de `/notifications/tokens` sin rate limiting (deliberado, ver más abajo) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| `/alerts`, `/alerts/inbox` y `/notifications/tokens` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox` y `/notifications/tokens`) | ✅ |
+| `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
 | CI: 104 tests unitarios + 123 de integración | ✅ |
@@ -546,6 +551,35 @@ Ambas son de path exacto (regex anclada), así que ni `alerts-route`
 (`~/api/v1/alerts$`) ni ninguna otra las captura, y ellas no capturan nada
 ajeno. `seen` no lleva `request-size-limiting`: no tiene body (responde `204`).
 
+## Baja de Cuenta: `DELETE /users/me` (US-11)
+
+Una Route más, `users-me-delete-route`, sobre `identity-service`. El usuario
+confirma la baja con su contraseña: el body es `{ "password": "<string>" }`.
+Identity la verifica (Argon2), borra los datos y emite `user.deleted`; el
+Gateway sólo perimetra el endpoint y reenvía la respuesta sin tocarla.
+
+| Route | Método y path | Plugins |
+|---|---|---|
+| `users-me-delete-route` | `DELETE /api/v1/users/me` | `jwt`, `token-offloading` (`X-User-Id`), `request-size-limiting` 1 KB, `rate-limiting` 3/min y 10/hora por `X-User-Id` |
+
+- **Misma ruta que el scaffold, separada por el método.** `identity-profile`
+  (`GET /api/v1/users/me`, `X-User-Hash`) no cambia: un `DELETE` no la matchea
+  ni un `GET` matchea ésta. Por la regla de US-08 la nueva es de path exacto
+  (`~/api/v1/users/me$`), así que no captura `/users/me/...`.
+- **Sin `app-attestation`**, con el mismo criterio que las Routes de alertas.
+  La defensa es la contraseña actual, que Identity exige en cada llamada, más
+  el rate limit por usuario, que acota los intentos de adivinarla con un JWT
+  robado.
+- **`X-User-Id`, no `X-User-Hash`.** Identity lee `X-User-Id` para saber a quién
+  dar de baja; el `Authorization` se quita antes de reenviar y un `X-User-Id`
+  forjado por el cliente se sobrescribe.
+- **El 204 también si el usuario ya no existe** (la baja es idempotente) y el
+  `401 INVALID_PASSWORD` son de Identity: el Gateway los propaga tal cual. Un
+  access token emitido antes de la baja sigue siendo válido hasta que vence
+  (15 min); durante ese plazo es Alert quien responde `403 ACCOUNT_DELETED`.
+- **El Gateway no loguea la contraseña.** El access log de Kong no incluye
+  bodies.
+
 ## Registro y Baja de Tokens FCM: `/notifications/tokens` (US-06)
 
 Dos Routes sobre el mismo Service `notification-service`, separadas por
@@ -654,7 +688,7 @@ ellos porque llegan por la red interna. Sin eso, cualquiera podría suplantar a
 otro usuario mandando el header desde afuera. La protección se aplica en dos
 capas distintas, según si la Route tiene `token-offloading` o no:
 
-- **Con `token-offloading`** (`/users/me`, `/vehicles`): el propio plugin
+- **Con `token-offloading`** (`/users/me`, `/vehicles`, `DELETE /users/me`): el propio plugin
   hace `clear_header` del header antes de escribir el suyo, en un único
   `access()` atómico — no hace falta ni conviene sumar otro plugin encima.
 - **Sin `token-offloading`** (`/auth/signup`, `/auth/signin`,
@@ -675,8 +709,8 @@ cobertura.
 El orden de plugins relevante en cada caso:
 
 ```
-Rutas con token-offloading (/users/me, /vehicles y, desde US-05/US-06/US-07,
-/alerts, /alerts/inbox y /notifications/tokens):
+Rutas con token-offloading (/users/me, /vehicles y, desde US-05/US-06/US-07/US-11,
+/alerts, /alerts/inbox, /notifications/tokens y DELETE /users/me):
   jwt (1450) → token-offloading (1000) → rate-limiting (910, todas salvo DELETE /notifications/tokens)
 
 Rutas sin token-offloading (signup, signin, refresh, logout):
