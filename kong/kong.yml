@@ -422,6 +422,80 @@ services:
               header_name: X-User-Hash
               remove_authorization: true
 
+      # US-11 — Baja de cuenta. Comparte el path con el scaffold
+      # `identity-profile` (GET), pero las separa el método: un `DELETE` nunca
+      # puede matchear aquélla ni un `GET` ésta. Declara path exacto (regex
+      # anclada con `$`) por la regla de US-08: un prefijo capturaría
+      # `/api/v1/users/me/...` y lo sometería a este perímetro. El body es
+      # `{ "password": "<string>" }`, la reautenticación de la baja: viaja sin
+      # sobre HPKE (la confidencialidad la aporta HTTPS) y el Gateway no la
+      # inspecciona ni la loguea (el access log no incluye bodies), sólo la
+      # reenvía. La verificación (Argon2) y el 401 `INVALID_PASSWORD` son de
+      # Identity. La baja es idempotente: responde 204 aunque el usuario ya no
+      # exista, así que un reintento de Kong ante un fallo de conexión
+      # (`retries` de `identity-service`) es inofensivo.
+      #
+      # Deliberadamente SIN `app-attestation`, con el mismo criterio que las
+      # Routes de alertas: la defensa es la contraseña actual, que Identity
+      # exige en cada llamada, más el `rate-limiting` por usuario de abajo,
+      # que acota los intentos de adivinarla con un JWT robado. Regla del
+      # repo: `app-attestation` se declara siempre por Route, nunca a nivel
+      # de Service, así que no se hereda de `identity-service`.
+      - name: users-me-delete-route
+        methods:
+          - DELETE
+        paths:
+          - ~/api/v1/users/me$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          # Mismo par que `alerts-inbox-route`: verifica la firma RS256 del
+          # Access Token e inyecta `X-User-Id` a partir del `sub` ya validado,
+          # quitando el `Authorization` antes de reenviar. Distinto del
+          # scaffold de arriba, que escribe `X-User-Hash`: Identity lee
+          # `X-User-Id` para saber a quién dar de baja. Corre en PRIORITY 1000,
+          # por encima de `rate-limiting` (910), para que el header ya exista
+          # cuando éste lee `limit_by: header`, y es la única protección
+          # contra un `X-User-Id` forjado por el cliente en esta Route.
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          # El body es una contraseña: 1 KB sobra y acota lo que se reenvía,
+          # igual que en feedback y report. Es el límite propio de la Route; el
+          # techo global de nginx no lo reemplaza.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 1
+              size_unit: kilobytes
+              require_content_length: false
+          # 3/min y 10/h por `X-User-Id`: la baja es irreversible y se hace
+          # una vez en la vida de la cuenta, así que el uso legítimo cabe
+          # holgado y el resto es abuso o fuerza bruta de la contraseña. El
+          # cupo es independiente por usuario: dos usuarios nunca comparten
+          # contador.
+          - name: rate-limiting
+            config:
+              minute: 3
+              hour: 10
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
   # ── vinculo-vial-vehicle ────────────────────────────────────────────────────
   # US-04 — Vinculación de Vehículo. Primer CU con Token Offloading real: el
   # body es un sobre HPKE con cifrado diferenciado (`dni_enc` para Identity,
