@@ -11,6 +11,6 @@ mkdir -p coverage
 VV_COVERAGE=1 busted spec/
 status=$?
 
-resty -e 'pcall(require, "luarocks.loader"); require("luacov.runner").run_report(".luacov")' || exit 1
+resty -e 'setmetatable(_G, nil); pcall(require, "luarocks.loader"); require("luacov.runner").run_report(".luacov")' || exit 1
 
 exit "$status"

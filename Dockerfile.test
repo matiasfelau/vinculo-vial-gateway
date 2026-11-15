@@ -27,13 +27,14 @@ RUN set -eux; \
     luarocks --only-server="https://luarocks.org/manifests/dhkolf" install dkjson; \
     luarocks install https://luarocks.org/manifests/hoelzro/lua-term-0.7-1.rockspec; \
     luarocks --only-server="$LR_LUNAR" install busted 2.0.0; \
+    luarocks --only-server="https://luarocks.org/manifests/hisham" install datafile; \
     luarocks --only-server="$LR_LUNAR" install luacov 0.17.0; \
     apt-get purge -y --auto-remove build-essential
 
 # Falla el build, y no el primer reporte de cobertura, si falta alguna de las
 # dos: `luacov` mide y `lfs` (que ya trae Kong) le sirve para listar los
 # archivos que ningún spec carga, que cuentan como 0 %.
-RUN resty -e 'pcall(require, "luarocks.loader"); require("luacov"); require("lfs")'
+RUN resty -e 'setmetatable(_G, nil); pcall(require, "luarocks.loader"); require("luacov.runner"); require("lfs")'
 
 # `busted` pasa a ser un wrapper sobre resty: así el comando documentado
 # (`busted spec/`) funciona tal cual dentro del contenedor.
