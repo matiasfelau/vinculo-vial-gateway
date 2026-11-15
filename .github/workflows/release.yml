@@ -15,6 +15,11 @@ on:
     branches: [main]
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
+# Mínimo privilegio a nivel workflow; el job que necesite más lo declara aparte.
+# También acota lo que puede pedir `tests.yml`, que se invoca desde acá.
+permissions:
+  contents: read
+
 # Un push a main y su tag correspondiente pueden disparar dos corridas casi
 # simultáneas sobre el mismo contenido; no tiene sentido cancelarse entre sí
 # (cada una construye un set de tags distinto), así que el grupo de
@@ -35,12 +40,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # El driver `docker` por defecto no soporta `cache-to: type=gha` (falla
       # con "Cache export is not supported for the docker driver"). Un builder
       # de buildx explícito sí lo soporta.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # `latest` y el SHA corto se publican siempre. El tag semántico sólo
       # cuando el disparador fue un push de tag `vX.Y.Z` — `github.ref_name`
@@ -67,7 +72,7 @@ jobs:
       # sin loguearse la baja sin problema. `load: true` importa el resultado
       # al daemon local, para poder pushearlo recién después del login.
       - name: Build (sin autenticar; evita el pull de kong:3.7 con un token de scope ajeno)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: false
@@ -81,7 +86,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Iniciar sesión en Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

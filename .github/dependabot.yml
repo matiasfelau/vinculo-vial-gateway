@@ -1,0 +1,19 @@
+# Actualizaciones semanales. Dependabot no tiene ecosistema para Lua/LuaRocks,
+# así que lo que cubre este repo es lo que sí puede versionar: las acciones de
+# los workflows (fijadas por SHA, Dependabot actualiza el SHA y el comentario de
+# versión) y las imágenes base de los Dockerfile (`kong:3.7`).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(docker)"

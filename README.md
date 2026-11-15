@@ -60,7 +60,7 @@ de `/notifications/tokens` no tienen body relevante.
 | Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 123 de integración | ✅ |
+| CI: 104 tests unitarios + 123 de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
 
 ## Estructura
 
@@ -82,7 +82,12 @@ kong/
 docker/entrypoint.sh              # renderiza kong.yml contra el entorno
 secrets/                          # credenciales montadas — no se versiona
 spec/                             # tests Busted
+spec/coverage.sh                  # Busted con LuaCov, deja el reporte en coverage/
 spec/integration/run.sh           # integración contra un stub de Google
+ci/                               # convertidor LuaCov -> Cobertura XML y sus pruebas
+.luacov                           # qué mide LuaCov
+.trivyignore                      # excepciones de Trivy, con motivo y fecha
+.github/dependabot.yml            # actualizaciones semanales de acciones e imágenes
 Dockerfile                        # imagen del Gateway (extiende kong:3.7)
 Dockerfile.test                   # imagen de test (Kong + Busted sobre resty)
 ```
@@ -198,6 +203,73 @@ No necesita credenciales reales:
 ```bash
 bash spec/integration/run.sh
 ```
+
+## CI
+
+`.github/workflows/tests.yml` corre en todo `pull_request` hacia `dev` o `main`
+(y en `push` a esas ramas, y como gate de `release.yml`). Cuatro jobs:
+
+| Job | Qué hace | ¿Corta? |
+|---|---|---|
+| `busted` | Specs con cobertura (LuaCov), reporte Cobertura XML, cobertura total en el resumen, diff-cover | Sí: spec rojo, o líneas nuevas con menos de 85 % |
+| `config` | Que Kong arranque `healthy` con los plugins propios | Sí |
+| `integration` | Suite de integración contra el stub de Google | Sí |
+| `security` | Trivy (`vuln`, `secret`, `misconfig`; HIGH y CRITICAL con corrección disponible) y Semgrep (`p/default`) | Trivy sí; Semgrep no, es informativo |
+
+Las acciones de terceros van fijadas por SHA de commit (la versión queda en un
+comentario) y los workflows declaran `permissions: contents: read`. Dependabot
+propone cada semana las actualizaciones de las acciones y de las imágenes base
+(`kong:3.7`).
+
+### Cobertura en local
+
+```bash
+docker build -f Dockerfile.test -t vinculo-vial-gateway-tests .
+mkdir -p coverage
+docker run --rm -v "$PWD/coverage:/app/coverage" vinculo-vial-gateway-tests sh spec/coverage.sh
+python ci/luacov_to_cobertura.py coverage/luacov.report.out coverage/cobertura.xml
+```
+
+`spec/coverage.sh` activa LuaCov con `VV_COVERAGE=1` (solo existe en la imagen
+de test, ver `.env.example`) y devuelve el código de salida de Busted. El
+reporte de texto de LuaCov queda en `coverage/luacov.report.out`, que
+`ci/luacov_to_cobertura.py` convierte a `coverage/cobertura.xml` y a un resumen
+por archivo. Las pruebas del convertidor corren con
+`python -m unittest discover -s ci`.
+
+**Qué se mide:** todo lo de `kong/plugins/` y `kong/lib/`, también los archivos
+que ningún spec carga (cuentan como 0 %). **No hay exclusiones:** no se excluye
+código escrito a mano y el repo no tiene código generado.
+
+**Alcance:** la cobertura es la de los specs de Busted. La suite de integración
+corre el Gateway real dentro de Docker y no se mide con LuaCov, así que no suma
+al reporte.
+
+### diff-cover: el gate sobre el código nuevo
+
+```bash
+pip install "diff-cover==10.6.0"
+git fetch origin dev
+diff-cover coverage/cobertura.xml --compare-branch=origin/dev --fail-under=85
+```
+
+El job usa `origin/<rama base del PR>`. Un PR que agrega una función Lua sin
+specs baja de 85 % sobre sus líneas nuevas y falla; al sumarle specs pasa. Un PR
+que no toca Lua no tiene líneas medibles y pasa. La cobertura total se publica
+en el resumen del job y como artefacto `cobertura-lua`, sin cortar: el gate
+sobre el total llega cuando el repo esté en 85 % o más.
+
+### Escaneos en local
+
+```bash
+trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+pip install "semgrep==1.185.0" && semgrep scan --config p/default --metrics=off
+```
+
+Las excepciones de Trivy viven solo en `.trivyignore`, cada una con el motivo y
+la fecha de revisión. Hoy hay una: `DS-0002` (usuario root) en `Dockerfile.test`,
+la imagen de test que nunca se publica. Semgrep es informativo hasta v0.14: sus
+hallazgos aparecen en el resumen del job `security`.
 
 ## Atestación: `X-App-Attestation`
 
