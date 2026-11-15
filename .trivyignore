@@ -1,0 +1,14 @@
+# Excepciones de Trivy. Cada una lleva el motivo y la fecha de revisión.
+
+# DS-0002 (HIGH): "Last USER command in Dockerfile should not be 'root'".
+# Alcanza a Dockerfile.test, que es la imagen donde corren los specs de Busted
+# en CI y en local. Nunca se publica ni se despliega, no expone puertos y solo
+# ejecuta código del propio repo. Corre como root porque hereda `USER root` para
+# instalar los rocks y porque el CI le monta `coverage/` desde el runner: con un
+# usuario no root el volumen no sería escribible. La imagen de producción
+# (Dockerfile) sí termina en un usuario no root y hoy no tiene este hallazgo.
+# Limitación: un .trivyignore ignora el ID en todo el repo, así que un `USER
+# root` nuevo en el Dockerfile de producción no lo detectaría Trivy; hasta
+# revisar esto, lo cubre la revisión de PRs.
+# Revisar a más tardar el 2027-02-15.
+DS-0002

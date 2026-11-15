@@ -8,6 +8,8 @@
 # al contexto de build ni a la imagen publicada.
 CLAUDE.md
 .clauderules
+clauderules
+CONTRATO-*.md
 
 # Control de versiones y CI.
 .git/
@@ -42,3 +44,6 @@ kong.rendered.yml
 kong.declarative.yml
 .luarocks/
 lua_modules/
+coverage/
+ci/
+__pycache__/

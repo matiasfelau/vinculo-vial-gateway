@@ -9,4 +9,11 @@ setmetatable(_G, nil)
 
 pcall(require, "luarocks.loader")
 
+-- Cobertura (`spec/coverage.sh`): LuaCov engancha `os.exit` para volcar las
+-- estadísticas al terminar, así que tiene que arrancar antes que Busted. Sin
+-- `VV_COVERAGE` no se carga y los specs corren igual que siempre.
+if os.getenv("VV_COVERAGE") == "1" then
+  require("luacov.runner")(".luacov")
+end
+
 require("busted.runner")({ standalone = false })
