@@ -8,6 +8,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # No propone versiones publicadas hace menos de una semana: da tiempo a que se
+    # detecte una publicación comprometida antes de adoptarla.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(ci)"
 
@@ -15,5 +19,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # No propone versiones publicadas hace menos de una semana: da tiempo a que se
+    # detecte una publicación comprometida antes de adoptarla.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(docker)"
