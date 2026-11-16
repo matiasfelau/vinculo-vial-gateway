@@ -59,8 +59,8 @@ jobs:
           python ci/luacov_to_cobertura.py coverage/luacov.report.out \
             coverage/cobertura.xml --markdown coverage/resumen.md
 
-      # Cobertura total: se publica, no corta el job (el gate sobre el total
-      # llega cuando el repo esté en 85 % o más).
+      # Cobertura total: se publica antes de decidir el gate, así el resumen
+      # queda aunque el gate falle.
       - name: Publicar la cobertura total
         run: |
           {
@@ -77,6 +77,15 @@ jobs:
           name: cobertura-lua
           path: coverage/
           if-no-files-found: error
+
+      # Gate sobre el total: el repo está en 85 % o más desde `chore/cobertura-85`
+      # y ninguna rama puede bajarlo. Corre también en `push` a `dev` y `main`.
+      # Reusa el convertidor con `--fail-under`, que escribe igual sus salidas y
+      # sólo decide el código de salida.
+      - name: Gate de cobertura total (>= 85 %)
+        run: |
+          python ci/luacov_to_cobertura.py coverage/luacov.report.out \
+            coverage/cobertura.xml --fail-under 85 > /dev/null
 
       # Gate sobre el código nuevo: las líneas Lua que cambia el PR respecto de
       # su rama base tienen que estar cubiertas al menos en un 85 %.

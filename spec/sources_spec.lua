@@ -119,4 +119,23 @@ describe("fuente mock", function()
     assert.is_nil(verdict)
     assert.equals("missing_key", reason)
   end)
+
+  it("rechaza un sobre JWT cuyo `exp` no es numérico", function()
+    local verdict = play.verdict(NOW)
+    verdict.exp = "mañana"
+
+    local parsed, reason = mock.fetch(play.sign_mock(verdict, PSK), conf)
+
+    assert.is_nil(parsed)
+    assert.equals("malformed_exp", reason)
+  end)
+
+  it("acepta un sobre vigente, con la tolerancia de reloj configurada", function()
+    local verdict = play.verdict(NOW)
+    verdict.exp = ngx.time() - 10 -- vencido hace 10 s, dentro de los 30 s de tolerancia
+
+    local parsed = mock.fetch(play.sign_mock(verdict, PSK), conf)
+
+    assert.is_not_nil(parsed)
+  end)
 end)

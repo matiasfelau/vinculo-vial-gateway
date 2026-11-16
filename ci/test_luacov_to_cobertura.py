@@ -125,7 +125,7 @@ class MarkdownTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
-    def run_cli(self, report_text):
+    def run_cli(self, report_text, *extra_args):
         tmp = Path(tempfile.mkdtemp())
         (tmp / "in.out").write_text(report_text, encoding="utf-8")
         result = subprocess.run(
@@ -136,6 +136,7 @@ class CliTest(unittest.TestCase):
                 str(tmp / "cobertura.xml"),
                 "--markdown",
                 str(tmp / "resumen.md"),
+                *extra_args,
             ],
             capture_output=True,
             text=True,
@@ -155,6 +156,36 @@ class CliTest(unittest.TestCase):
         result, tmp = self.run_cli("")
         self.assertEqual(result.returncode, 1)
         self.assertFalse((tmp / "cobertura.xml").exists())
+
+    # REPORT cubre 2 de 5 líneas ejecutables: 40,00 % en total.
+    def test_fail_under_fails_below_the_threshold_but_still_writes_the_reports(self):
+        result, tmp = self.run_cli(REPORT, "--fail-under", "85")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("40.00 %", result.stderr)
+        self.assertIn("85 %", result.stderr)
+        self.assertTrue((tmp / "cobertura.xml").exists())
+        self.assertIn("Cobertura total", (tmp / "resumen.md").read_text(encoding="utf-8"))
+
+    def test_fail_under_accepts_a_total_exactly_at_the_threshold(self):
+        result, _ = self.run_cli(REPORT, "--fail-under", "40")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fail_under_accepts_a_total_above_the_threshold(self):
+        result, _ = self.run_cli(REPORT, "--fail-under", "39.99")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_without_fail_under_a_low_total_does_not_fail(self):
+        result, _ = self.run_cli(REPORT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TotalPercentTest(unittest.TestCase):
+    def test_is_computed_over_all_executable_lines_not_averaged_per_file(self):
+        # errors.lua: 2 de 3; handler.lua: 0 de 2 -> 2 de 5, no el promedio de 66,7 y 0.
+        self.assertAlmostEqual(conv.total_percent(conv.parse_report(REPORT)), 40.0)
+
+    def test_without_measured_lines_it_is_fully_covered(self):
+        self.assertEqual(conv.total_percent([]), 100.0)
 
 
 if __name__ == "__main__":
