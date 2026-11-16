@@ -1,0 +1,17 @@
+-- Configuración de LuaCov. Se activa con `VV_COVERAGE=1` (ver spec/coverage.sh).
+--
+-- Se mide el código de producción de los plugins y de las librerías propias.
+-- Los specs quedan afuera, y no se excluye ningún archivo a mano: todo lo que
+-- está en estos dos directorios cuenta, también el que ningún spec carga.
+return {
+  -- Directorio que el CI monta como volumen para sacar el reporte del contenedor.
+  statsfile = "coverage/luacov.stats.out",
+  reportfile = "coverage/luacov.report.out",
+
+  -- Patrones de Lua sobre la ruta relativa sin `.lua`. El `^` evita capturar
+  -- los `kong/plugins/...` de la instalación de Kong, que viven en otra ruta.
+  include = { "^kong/plugins/", "^kong/lib/" },
+
+  -- Lista los archivos de estos directorios que ningún spec ejecutó, con 0 %.
+  includeuntestedfiles = { "kong/plugins", "kong/lib" },
+}

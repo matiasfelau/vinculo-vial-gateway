@@ -12,6 +12,11 @@ on:
   # en vez de duplicar los mismos tres jobs en dos archivos.
   workflow_call:
 
+# Mínimo privilegio: ningún job escribe en el repo. Al reusarse desde
+# `release.yml`, este tope también acota a ese workflow.
+permissions:
+  contents: read
+
 # Un PR con varios pushes seguidos sólo necesita el resultado del último.
 concurrency:
   group: tests-${{ github.ref }}
@@ -19,24 +24,86 @@ concurrency:
 
 jobs:
   busted:
-    name: Busted (plugins Lua)
+    name: Busted (plugins Lua) y cobertura
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # El historial completo hace falta para que diff-cover pueda comparar
+      # contra la rama base del PR.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       # La imagen de test se construye sobre la misma imagen de Kong que usa
       # producción: los specs corren contra el runtime real de OpenResty.
       - name: Construir la imagen de test
         run: docker build -f Dockerfile.test -t vinculo-vial-gateway-tests .
 
-      - name: Correr la suite
-        run: docker run --rm vinculo-vial-gateway-tests
+      # Los specs corren en Docker, así que el reporte de LuaCov sale por un
+      # volumen. `spec/coverage.sh` devuelve el código de salida de Busted:
+      # un spec rojo falla el job aunque el reporte se genere igual.
+      - name: Correr la suite con cobertura
+        run: |
+          mkdir -p coverage
+          docker run --rm -v "$PWD/coverage:/app/coverage" \
+            vinculo-vial-gateway-tests sh spec/coverage.sh
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # `ci/` convierte el reporte de LuaCov a Cobertura XML, que es lo que lee
+      # diff-cover. Sus pruebas corren antes de confiar en el resultado.
+      - name: Probar el convertidor y generar el reporte Cobertura
+        run: |
+          python -m unittest discover -s ci -v
+          python ci/luacov_to_cobertura.py coverage/luacov.report.out \
+            coverage/cobertura.xml --markdown coverage/resumen.md
+
+      # Cobertura total: se publica, no corta el job (el gate sobre el total
+      # llega cuando el repo esté en 85 % o más).
+      - name: Publicar la cobertura total
+        run: |
+          {
+            echo "### Cobertura de los plugins Lua"
+            echo
+            echo "Solo suites de Busted: la integración corre el Gateway real y no se mide con LuaCov."
+            echo
+            cat coverage/resumen.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir el reporte de cobertura
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cobertura-lua
+          path: coverage/
+          if-no-files-found: error
+
+      # Gate sobre el código nuevo: las líneas Lua que cambia el PR respecto de
+      # su rama base tienen que estar cubiertas al menos en un 85 %.
+      - name: diff-cover (líneas nuevas >= 85 %)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          pip install "diff-cover==10.6.0"
+          set +e
+          diff-cover coverage/cobertura.xml \
+            --compare-branch="origin/${BASE_REF}" \
+            --fail-under=85 \
+            --format markdown:coverage/diff-cover.md,console:stdout
+          status=$?
+          {
+            echo "### diff-cover contra \`${BASE_REF}\`"
+            echo
+            cat coverage/diff-cover.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   config:
     name: Configuración declarativa
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Construir la imagen del Gateway
         run: docker build -t vinculo-vial-gateway:ci .
@@ -53,6 +120,7 @@ jobs:
             -e VEHICLE_SERVICE_URL=http://vehicle.invalid:8080 \
             -e ALERT_SERVICE_URL=http://alert.invalid:8080 \
             -e NOTIFICATION_SERVICE_URL=http://notification.invalid:8080 \
+            -e BENEFITS_SERVICE_URL=http://benefits.invalid:8080 \
             vinculo-vial-gateway:ci
 
           for i in $(seq 1 30); do
@@ -80,7 +148,7 @@ jobs:
     name: Integración (Play Integrity contra stub)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Ejercita el camino HTTP completo contra Google —firma de la aserción
       # del service account, canje por access token, decodeIntegrityToken— que
@@ -88,3 +156,46 @@ jobs:
       # emula ambos endpoints.
       - name: Correr la suite de integración
         run: bash spec/integration/run.sh
+
+  security:
+    name: Seguridad (Trivy y Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Gate: falla ante HIGH o CRITICAL con corrección disponible. Las
+      # excepciones viven solo en `.trivyignore`, con motivo y fecha de revisión.
+      - name: Trivy (vulnerabilidades, secretos y configuración)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # Informativo: no corta el job (pasa a gate en v0.14). El resultado va al
+      # resumen, sin el código de cada hallazgo.
+      - name: Semgrep (informativo)
+        continue-on-error: true
+        run: |
+          pip install "semgrep==1.185.0"
+          semgrep scan --config p/default --metrics=off --json --output semgrep.json
+
+      - name: Publicar los hallazgos de Semgrep
+        if: always()
+        run: |
+          {
+            echo "### Semgrep (informativo)"
+            echo
+            if [ -f semgrep.json ]; then
+              jq -r '"**\(.results | length) hallazgos**\n\n| Severidad | Regla | Ubicación |\n|---|---|---|", (.results[] | "| \(.extra.severity) | \(.check_id | split(".") | last) | \(.path):\(.start.line) |")' semgrep.json
+            else
+              echo "Semgrep no produjo reporte."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
