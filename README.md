@@ -46,6 +46,7 @@ de `/notifications/tokens` no tienen body relevante.
 | Ruteo declarativo a `alert-service` (`/alerts/inbox`, US-07) | ✅ |
 | Ruteo declarativo a `notification-service` (`POST /notifications/tokens`, US-06) | ✅ |
 | Ruteo declarativo a `notification-service` (`DELETE /notifications/tokens`, US-06) | ✅ |
+| Ruteo y rate limiting por usuario en `GET /vehicles` (30/min), `POST /vehicles/unlink` (10/min, 30/hora) y `DELETE /vehicles` (3/min, 10/hora), US-14 | ✅ |
 | Rate limiting global | ✅ |
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
@@ -56,11 +57,11 @@ de `/notifications/tokens` no tienen body relevante.
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles`, `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me`) | ✅ |
+| `/alerts`, `/alerts/inbox`, `/notifications/tokens`, `DELETE /users/me` y las Routes de `/vehicles` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` (las 4 Routes), `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me`) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 123 de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
+| CI: 104 tests unitarios + 321 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
 
 ## Estructura
 
@@ -477,6 +478,49 @@ la red Docker — cualquier contenedor de esa red puede llamar a Identity
 directamente. El aislamiento real (puerto interno separado y/o un secreto
 servicio a servicio) es responsabilidad de Identity, documentado en su propio
 `CLAUDE.md`. El Gateway sólo cubre la mitad perimetral del problema.
+
+## Vinculación por dominio: `/vehicles` (US-14)
+
+US-14 reemplaza el escaneo del QR de la cédula (US-04) por la carga del dominio
+a mano: el usuario vincula una patente a su cuenta **sin que se verifique la
+titularidad** (riesgo aceptado y mitigado con un tope de 3 vehículos por
+usuario, que aplica Vehicle). Para el Gateway cambia poco: el alta
+(`POST /vehicles`) no se toca —`vehicles-route` sigue como estaba; ahora su body
+es `{ "payload_enc" }` y el Gateway, como siempre, no lo inspecciona— y se suman
+tres Routes sobre `vehicle-service`.
+
+| Route | Método y path | Plugins |
+|---|---|---|
+| `vehicles-route` (sin cambios) | `POST /api/v1/vehicles` | `jwt`, `token-offloading` (`X-User-Id`) |
+| `vehicles-count-route` | `GET /api/v1/vehicles` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 30/min por `X-User-Id` |
+| `vehicles-unlink-route` | `POST /api/v1/vehicles/unlink` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 10/min y 30/hora por `X-User-Id` |
+| `vehicles-unlink-all-route` | `DELETE /api/v1/vehicles` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 3/min y 10/hora por `X-User-Id` |
+
+- **Path exacto, regex anclada** (`~/api/v1/vehicles$`, `~/api/v1/vehicles/unlink$`),
+  como la ruta vigente: no capturan barras finales, subrecursos ni paths con el
+  mismo prefijo (el viejo `/vehicles/check` sigue sin Route y da 404). `GET` y
+  `DELETE` comparten el path con el alta, pero las separa el método.
+- **Orden de plugins:** `jwt`, después `token-offloading` (PRIORITY 1000) y
+  después `rate-limiting` (910) por `X-User-Id`, que ya está escrito cuando éste
+  lo lee. El cupo es independiente por usuario y por Route: agotar el de
+  `DELETE` no corta el `GET` ni el `unlink` del mismo usuario.
+- **Sin `app-attestation`**, como el alta y las Routes de alertas: la defensa es
+  el JWT más el rate limit por usuario. Se declara siempre por Route, nunca por
+  Service.
+- **Por qué esos límites.** El `GET` es lectura de un contador propio y sin
+  efectos (30/min). `unlink` responde `404 VEHICLE_NOT_FOUND` si el usuario no
+  tiene esa patente, así que se acota (10/min, 30/hora); el uso legítimo es
+  corregir una patente mal escrita. `DELETE` es destructiva y de uso
+  excepcional, igual que la baja de cuenta (3/min, 10/hora).
+- **Ninguna respuesta lleva patentes**: Vehicle devuelve `{ "count", "max" }` o
+  un `204`, y el Gateway las propaga sin transformarlas. El `payload_enc` de
+  `unlink` es un sobre HPKE que sólo abre Vehicle; el access log de Kong no
+  incluye bodies, así que no aparece en los logs (la suite lo verifica).
+- **Errores de Vehicle** (`INVALID_PLATE` 400, `VEHICLE_NOT_FOUND` 404,
+  `DUPLICATE_VEHICLE` y `VEHICLE_LIMIT_REACHED` 409, `DEPENDENCY_UNAVAILABLE` 503
+  con `Retry-After`) son de Vehicle: el Gateway los reenvía tal cual.
+- **Sin límite de tamaño propio** en `unlink`, igual que el alta vigente: lo
+  acota el techo global de nginx (ver "Tamaño del payload").
 
 ## Escaneo de Patente: `/alerts` (US-05)
 
