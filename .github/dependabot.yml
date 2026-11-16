@@ -6,6 +6,8 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # Los PRs de Dependabot van con base `dev`, como todo PR de este repo.
+    target-branch: dev
     schedule:
       interval: weekly
     # No propone versiones publicadas hace menos de una semana: da tiempo a que se
@@ -17,6 +19,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     # No propone versiones publicadas hace menos de una semana: da tiempo a que se

@@ -219,7 +219,9 @@ bash spec/integration/run.sh
 Las acciones de terceros van fijadas por SHA de commit (la versión queda en un
 comentario) y los workflows declaran `permissions: contents: read`. Dependabot
 propone cada semana las actualizaciones de las acciones y de las imágenes base
-(`kong:3.7`).
+(`kong:3.7`), con PRs contra `dev` (`target-branch`). Ojo: Dependabot lee
+`dependabot.yml` de la rama por defecto (`main`), así que un cambio en esa
+configuración recién rige cuando `dev` llega a `main`.
 
 ### Cobertura en local
 
