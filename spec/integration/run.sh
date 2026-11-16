@@ -1365,6 +1365,273 @@ check "otro usuario no comparte el contador de la baja" \
   200 "$(route_status DELETE "${u11_me}" "${u11_rl_other}")"
 
 echo
+echo "Vinculación por dominio (US-14): matriz de ruteo (conteo, unlink y unlink-all)"
+
+# Cada Route de US-14 declara su propio `rate-limiting` y Kong expone su límite
+# en `X-RateLimit-Limit-*`: es lo que identifica QUÉ Route atendió el request.
+# Sólo los requests ruteados gastan cupo (un 404 de Kong, un 401 o un 413 cortan
+# antes), así que cada grupo usa su propio usuario.
+u14_vehicles="/api/v1/vehicles"
+u14_unlink="/api/v1/vehicles/unlink"
+u14_token_for() {
+  sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"$1\",\"exp\":$((now + 300))}"
+}
+u14_get_user="a1b2c3d4-0001-4a5b-8c6d-7e8f9a0b1c2d"
+u14_unlink_user="a1b2c3d4-0002-4a5b-8c6d-7e8f9a0b1c2d"
+u14_all_user="a1b2c3d4-0003-4a5b-8c6d-7e8f9a0b1c2d"
+u14_get_token="$(u14_token_for "${u14_get_user}")"
+u14_unlink_token="$(u14_token_for "${u14_unlink_user}")"
+u14_all_token="$(u14_token_for "${u14_all_user}")"
+
+u14_get_headers="$(route_headers GET "${u14_vehicles}" "${u14_get_token}")"
+check_contains "GET /api/v1/vehicles → vehicles-count-route" \
+  "http/1.1 200" "${u14_get_headers}"
+check_contains "GET /api/v1/vehicles lo atiende vehicles-count-route (30/min)" \
+  "x-ratelimit-limit-minute: 30" "${u14_get_headers}"
+check_not_contains "GET /api/v1/vehicles no tiene tope por hora" \
+  "x-ratelimit-limit-hour" "${u14_get_headers}"
+
+u14_unlink_headers="$(route_headers POST "${u14_unlink}" "${u14_unlink_token}")"
+check_contains "POST /api/v1/vehicles/unlink → vehicles-unlink-route" \
+  "http/1.1 200" "${u14_unlink_headers}"
+check_contains "POST /api/v1/vehicles/unlink lo atiende vehicles-unlink-route (10/min)" \
+  "x-ratelimit-limit-minute: 10" "${u14_unlink_headers}"
+check_contains "POST /api/v1/vehicles/unlink lo atiende vehicles-unlink-route (30/h)" \
+  "x-ratelimit-limit-hour: 30" "${u14_unlink_headers}"
+
+u14_all_headers="$(route_headers DELETE "${u14_vehicles}" "${u14_all_token}")"
+check_contains "DELETE /api/v1/vehicles → vehicles-unlink-all-route" \
+  "http/1.1 200" "${u14_all_headers}"
+check_contains "DELETE /api/v1/vehicles lo atiende vehicles-unlink-all-route (3/min)" \
+  "x-ratelimit-limit-minute: 3" "${u14_all_headers}"
+check_contains "DELETE /api/v1/vehicles lo atiende vehicles-unlink-all-route (10/h)" \
+  "x-ratelimit-limit-hour: 10" "${u14_all_headers}"
+
+# El alta vigente no se toca: sigue en `vehicles-route`, que no declara
+# `rate-limiting` propio, así que ve el perímetro por IP (60/min), no los
+# límites de las Routes nuevas.
+u14_post_user="a1b2c3d4-0004-4a5b-8c6d-7e8f9a0b1c2d"
+u14_post_headers="$(route_headers POST "${u14_vehicles}" "$(u14_token_for "${u14_post_user}")")"
+check_contains "POST /api/v1/vehicles sigue en vehicles-route (200)" \
+  "http/1.1 200" "${u14_post_headers}"
+check_contains "POST /api/v1/vehicles sigue sin rate-limiting propio (perímetro por IP)" \
+  "x-ratelimit-limit-minute: 60" "${u14_post_headers}"
+
+# Los demás métodos no tienen Route en ninguno de los dos paths.
+u14_probe="$(u14_token_for "a1b2c3d4-0005-4a5b-8c6d-7e8f9a0b1c2d")"
+check "PUT /api/v1/vehicles (método sin Route) → 404" \
+  404 "$(route_status PUT "${u14_vehicles}" "${u14_probe}")"
+check "PATCH /api/v1/vehicles (método sin Route) → 404" \
+  404 "$(route_status PATCH "${u14_vehicles}" "${u14_probe}")"
+check "GET /api/v1/vehicles/unlink (método sin Route) → 404" \
+  404 "$(route_status GET "${u14_unlink}" "${u14_probe}")"
+check "DELETE /api/v1/vehicles/unlink (método sin Route) → 404" \
+  404 "$(route_status DELETE "${u14_unlink}" "${u14_probe}")"
+check "PUT /api/v1/vehicles/unlink (método sin Route) → 404" \
+  404 "$(route_status PUT "${u14_unlink}" "${u14_probe}")"
+
+echo
+echo "Vinculación por dominio (US-14): path exacto"
+
+# Regex anclada con `$`: ninguna Route captura barras finales, subrecursos ni
+# paths que sólo comparten prefijo.
+check "GET /api/v1/vehicles/ (barra final) → 404" \
+  404 "$(route_status GET "${u14_vehicles}/" "${u14_probe}")"
+check "GET /api/v1/vehicles/extra → 404" \
+  404 "$(route_status GET "${u14_vehicles}/extra" "${u14_probe}")"
+check "GET /api/v1/vehicles/check (eliminado en US-08) → 404" \
+  404 "$(route_status GET "${u14_vehicles}/check" "${u14_probe}")"
+check "GET /api/v1/vehiclesx (mismo prefijo) → 404" \
+  404 "$(route_status GET /api/v1/vehiclesx "${u14_probe}")"
+check "DELETE /api/v1/vehicles/ (barra final) → 404" \
+  404 "$(route_status DELETE "${u14_vehicles}/" "${u14_probe}")"
+check "DELETE /api/v1/vehicles/extra → 404" \
+  404 "$(route_status DELETE "${u14_vehicles}/extra" "${u14_probe}")"
+check "DELETE /api/v1/vehicles/check → 404" \
+  404 "$(route_status DELETE "${u14_vehicles}/check" "${u14_probe}")"
+check "POST /api/v1/vehicles/unlink/ (barra final) → 404" \
+  404 "$(route_status POST "${u14_unlink}/" "${u14_probe}")"
+check "POST /api/v1/vehicles/unlink/extra → 404" \
+  404 "$(route_status POST "${u14_unlink}/extra" "${u14_probe}")"
+check "POST /api/v1/vehicles/unlinkx (mismo prefijo) → 404" \
+  404 "$(route_status POST "${u14_unlink}x" "${u14_probe}")"
+check "POST /api/v1/vehicles/unlink/{uuid} → 404" \
+  404 "$(route_status POST "${u14_unlink}/0f1e2d3c-4b5a-4968-8776-655443322110" "${u14_probe}")"
+
+echo
+echo "Vinculación por dominio (US-14): seguridad (JWT y Token Offloading)"
+
+# Cada Route exige un JWT válido: sin Authorization, mal formado, vencido o con
+# un `iss` sin consumer registrado se corta con 401 antes de llegar a Vehicle.
+u14_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u14_probe}\",\"exp\":$((now - 300))}")"
+u14_wrong_iss="$(sign_jwt "{\"iss\":\"otro-emisor\",\"sub\":\"${u14_get_user}\",\"exp\":$((now + 300))}")"
+u14_unlink_body='{"payload_enc":"cripto-para-vehicle"}'
+
+check "sin Authorization, 401: GET /vehicles" \
+  401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X GET "http://127.0.0.1:8000${u14_vehicles}")"
+check "sin Authorization, 401: POST /vehicles/unlink" \
+  401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST "http://127.0.0.1:8000${u14_unlink}" \
+    -H 'Content-Type: application/json' --data-binary "${u14_unlink_body}")"
+check "sin Authorization, 401: DELETE /vehicles" \
+  401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:8000${u14_vehicles}")"
+
+check "JWT mal formado, 401: GET /vehicles" \
+  401 "$(route_status GET "${u14_vehicles}" "no-es-un-jwt")"
+check "JWT mal formado, 401: POST /vehicles/unlink" \
+  401 "$(route_status POST "${u14_unlink}" "no-es-un-jwt")"
+check "JWT mal formado, 401: DELETE /vehicles" \
+  401 "$(route_status DELETE "${u14_vehicles}" "no-es-un-jwt")"
+
+check "JWT expirado, 401: GET /vehicles" \
+  401 "$(route_status GET "${u14_vehicles}" "${u14_expired}")"
+check "JWT expirado, 401: POST /vehicles/unlink" \
+  401 "$(route_status POST "${u14_unlink}" "${u14_expired}")"
+check "JWT expirado, 401: DELETE /vehicles" \
+  401 "$(route_status DELETE "${u14_vehicles}" "${u14_expired}")"
+
+check "JWT con un iss sin consumer registrado, 401: GET /vehicles" \
+  401 "$(route_status GET "${u14_vehicles}" "${u14_wrong_iss}")"
+check "JWT con un iss sin consumer registrado, 401: POST /vehicles/unlink" \
+  401 "$(route_status POST "${u14_unlink}" "${u14_wrong_iss}")"
+check "JWT con un iss sin consumer registrado, 401: DELETE /vehicles" \
+  401 "$(route_status DELETE "${u14_vehicles}" "${u14_wrong_iss}")"
+
+# Con un JWT válido, Vehicle recibe `X-User-Id` con el `sub` y no recibe el
+# `Authorization`. Un `X-User-Id` forjado por el cliente se descarta: es la
+# única protección contra vincular o desvincular a nombre de otro usuario.
+u14_get_view="$(docker exec "${GATEWAY}" curl -s \
+  -X GET "http://127.0.0.1:8000${u14_vehicles}" \
+  -H "Authorization: Bearer ${u14_get_token}" \
+  -H 'X-User-Id: usuario-suplantado' | tr '[:upper:]' '[:lower:]')"
+check_contains "X-User-Id del JWT llega al upstream: GET /vehicles" \
+  "\"x-user-id\": \"${u14_get_user}\"" "${u14_get_view}"
+check_not_contains "el X-User-Id forjado se descarta: GET /vehicles" \
+  "usuario-suplantado" "${u14_get_view}"
+check_not_contains "el Authorization no se propaga: GET /vehicles" \
+  "authorization" "${u14_get_view}"
+
+u14_unlink_view="$(docker exec "${GATEWAY}" curl -s \
+  -X POST "http://127.0.0.1:8000${u14_unlink}" \
+  -H "Authorization: Bearer ${u14_unlink_token}" \
+  -H 'X-User-Id: usuario-suplantado' \
+  -H 'Content-Type: application/json' \
+  --data-binary "${u14_unlink_body}")"
+check_contains "X-User-Id del JWT llega al upstream: POST /vehicles/unlink" \
+  "\"x-user-id\": \"${u14_unlink_user}\"" "$(printf '%s' "${u14_unlink_view}" | tr '[:upper:]' '[:lower:]')"
+check_not_contains "el X-User-Id forjado se descarta: POST /vehicles/unlink" \
+  "usuario-suplantado" "${u14_unlink_view}"
+check_not_contains "el Authorization no se propaga: POST /vehicles/unlink" \
+  "authorization" "$(printf '%s' "${u14_unlink_view}" | tr '[:upper:]' '[:lower:]')"
+check_contains "el sobre HPKE de unlink se reenvía sin tocar" \
+  "cripto-para-vehicle" "${u14_unlink_view}"
+
+u14_all_view="$(docker exec "${GATEWAY}" curl -s \
+  -X DELETE "http://127.0.0.1:8000${u14_vehicles}" \
+  -H "Authorization: Bearer ${u14_all_token}" \
+  -H 'X-User-Id: usuario-suplantado' | tr '[:upper:]' '[:lower:]')"
+check_contains "X-User-Id del JWT llega al upstream: DELETE /vehicles" \
+  "\"x-user-id\": \"${u14_all_user}\"" "${u14_all_view}"
+check_not_contains "el X-User-Id forjado se descarta: DELETE /vehicles" \
+  "usuario-suplantado" "${u14_all_view}"
+check_not_contains "el Authorization no se propaga: DELETE /vehicles" \
+  "authorization" "${u14_all_view}"
+
+# El Gateway no loguea bodies: el sobre de `unlink` (que cifra una patente) no
+# puede aparecer en sus logs.
+u14_marker_user="a1b2c3d4-0006-4a5b-8c6d-7e8f9a0b1c2d"
+docker exec "${GATEWAY}" curl -s -o /dev/null \
+  -X POST "http://127.0.0.1:8000${u14_unlink}" \
+  -H "Authorization: Bearer $(u14_token_for "${u14_marker_user}")" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"payload_enc":"marcador-de-patente-cifrada"}'
+check_not_contains "el sobre de unlink no aparece en los logs del Gateway" \
+  "marcador-de-patente-cifrada" "$(docker logs "${GATEWAY}" 2>&1)"
+
+echo
+echo "Vinculación por dominio (US-14): las respuestas de Vehicle se propagan"
+
+# El upstream de eco devuelve el status que pide `x-set-response-status-code`.
+# El Gateway no transforma las respuestas de estas Routes: el 204 de la
+# desvinculación total y los códigos de error de Vehicle llegan tal cual.
+u14_status_user="a1b2c3d4-0007-4a5b-8c6d-7e8f9a0b1c2d"
+u14_status_token="$(u14_token_for "${u14_status_user}")"
+u14_forced_status() {
+  local method="$1" path="$2" code="$3"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u14_status_token}" \
+    -H 'Content-Type: application/json' \
+    -H "x-set-response-status-code: ${code}" \
+    --data-binary '{}'
+}
+check "el 204 de DELETE /vehicles se propaga" \
+  204 "$(u14_forced_status DELETE "${u14_vehicles}" 204)"
+check "el 404 VEHICLE_NOT_FOUND de unlink se propaga" \
+  404 "$(u14_forced_status POST "${u14_unlink}" 404)"
+check "el 400 INVALID_PLATE de unlink se propaga" \
+  400 "$(u14_forced_status POST "${u14_unlink}" 400)"
+check "el 503 DEPENDENCY_UNAVAILABLE de GET /vehicles se propaga" \
+  503 "$(u14_forced_status GET "${u14_vehicles}" 503)"
+
+echo
+echo "Vinculación por dominio (US-14): rate limiting por X-User-Id"
+
+# Mismo guard de reloj que el de US-09 y US-11: la ventana fija del contador
+# `local` se alinea al minuto de reloj y, si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado.
+u9_wait_clock_minute 35
+
+u14_rl_get="$(u14_token_for "a1b2c3d4-0101-4a5b-8c6d-7e8f9a0b1c2d")"
+u14_rl_other="$(u14_token_for "a1b2c3d4-0102-4a5b-8c6d-7e8f9a0b1c2d")"
+
+# Si un GET cayera en una Route de 10/min o de 3/min, esta ráfaga habría
+# fallado mucho antes del trigésimo.
+for _ in $(seq 1 29); do
+  route_status GET "${u14_vehicles}" "${u14_rl_get}" >/dev/null
+done
+check "el request 30 de GET /vehicles en el minuto todavía pasa" \
+  200 "$(route_status GET "${u14_vehicles}" "${u14_rl_get}")"
+check "el request 31 de GET /vehicles en el minuto → 429" \
+  429 "$(route_status GET "${u14_vehicles}" "${u14_rl_get}")"
+check "otro usuario no comparte el contador de GET /vehicles" \
+  200 "$(route_status GET "${u14_vehicles}" "${u14_rl_other}")"
+
+u9_wait_clock_minute 45
+
+u14_rl_unlink="$(u14_token_for "a1b2c3d4-0103-4a5b-8c6d-7e8f9a0b1c2d")"
+for _ in $(seq 1 9); do
+  route_status POST "${u14_unlink}" "${u14_rl_unlink}" >/dev/null
+done
+check "el request 10 de unlink en el minuto todavía pasa" \
+  200 "$(route_status POST "${u14_unlink}" "${u14_rl_unlink}")"
+check "el request 11 de unlink en el minuto → 429" \
+  429 "$(route_status POST "${u14_unlink}" "${u14_rl_unlink}")"
+check "otro usuario no comparte el contador de unlink" \
+  200 "$(route_status POST "${u14_unlink}" "${u14_rl_other}")"
+
+u14_rl_all="$(u14_token_for "a1b2c3d4-0104-4a5b-8c6d-7e8f9a0b1c2d")"
+for _ in $(seq 1 2); do
+  route_status DELETE "${u14_vehicles}" "${u14_rl_all}" >/dev/null
+done
+check "el request 3 de DELETE /vehicles en el minuto todavía pasa" \
+  200 "$(route_status DELETE "${u14_vehicles}" "${u14_rl_all}")"
+check "el request 4 de DELETE /vehicles en el minuto → 429" \
+  429 "$(route_status DELETE "${u14_vehicles}" "${u14_rl_all}")"
+check "otro usuario no comparte el contador de DELETE /vehicles" \
+  200 "$(route_status DELETE "${u14_vehicles}" "${u14_rl_other}")"
+
+# Los tres contadores son independientes entre sí: agotar uno no corta a los
+# otros, aunque compartan path y usuario.
+check "con DELETE agotado, el mismo usuario sigue pudiendo hacer GET" \
+  200 "$(route_status GET "${u14_vehicles}" "${u14_rl_all}")"
+check "con DELETE agotado, el mismo usuario sigue pudiendo hacer unlink" \
+  200 "$(route_status POST "${u14_unlink}" "${u14_rl_all}")"
+
+echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
 
 # Mismo usuario que en las secciones anteriores: el rate-limiting de esta

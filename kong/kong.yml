@@ -557,6 +557,141 @@ services:
               header_name: X-User-Id
               remove_authorization: true
 
+      # US-14 — Vinculación por dominio: conteo y desvinculación. Las tres
+      # Routes que siguen comparten el path `/api/v1/vehicles` con
+      # `vehicles-route` (el alta, que no se toca), pero las separa el método
+      # (GET y DELETE) o el sufijo exacto (`/unlink`). Cada una declara path
+      # exacto (regex anclada con `$`) por la regla de US-08: un prefijo
+      # capturaría subrecursos como el viejo `/api/v1/vehicles/check` y los
+      # sometería a este perímetro. Ninguna respuesta de Vehicle lleva
+      # patentes —sólo `{ "count", "max" }` o un 204—, y el Gateway no
+      # transforma las respuestas ni inspecciona los bodies: el `payload_enc`
+      # de `unlink` es un sobre HPKE que sólo abre Vehicle.
+      #
+      # Mismo criterio que el alta: deliberadamente SIN `app-attestation`
+      # (se declara siempre por Route, nunca por Service, así que no se hereda
+      # de `vehicle-service`). La defensa es el JWT más el `rate-limiting` por
+      # usuario de cada una. Corren con el par jwt + token-offloading de
+      # `vehicles-route`; `token-offloading` está en PRIORITY 1000, por encima
+      # de `rate-limiting` (910), para que `X-User-Id` exista cuando éste lee
+      # `limit_by: header`, y es la única protección contra un `X-User-Id`
+      # forjado por el cliente en estas Routes.
+
+      # Cuántos vehículos tiene vinculados el usuario de la sesión. Lectura
+      # idempotente y sin efectos, que sólo devuelve un contador propio:
+      # 30/min por `X-User-Id`.
+      - name: vehicles-count-route
+        methods:
+          - GET
+        paths:
+          - ~/api/v1/vehicles$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Desvincula una patente que el usuario vuelve a escribir. Responde 404
+      # `VEHICLE_NOT_FOUND` si no la tiene vinculada, así que es un oráculo
+      # de pertenencia sobre las propias vinculaciones (no sobre las de otros:
+      # Vehicle sólo busca entre las del usuario de la sesión), y el uso
+      # legítimo —corregir una patente mal cargada— es ocasional: 10/min y
+      # 30/h por `X-User-Id`.
+      - name: vehicles-unlink-route
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/vehicles/unlink$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 10
+              hour: 30
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
+      # Desvincula todos los vehículos del usuario: la salida para quien no
+      # recuerda cómo escribió una patente. Sin body. Es destructiva y de
+      # uso excepcional, igual que la baja de cuenta: 3/min y 10/h por
+      # `X-User-Id`. Idempotente en Vehicle, así que un reintento de Kong ante
+      # un fallo de conexión (`retries` de `vehicle-service`) es inofensivo.
+      - name: vehicles-unlink-all-route
+        methods:
+          - DELETE
+        paths:
+          - ~/api/v1/vehicles$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: true
+          - name: token-offloading
+            config:
+              claim: sub
+              header_name: X-User-Id
+              remove_authorization: true
+          - name: rate-limiting
+            config:
+              minute: 3
+              hour: 10
+              limit_by: header
+              header_name: X-User-Id
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+
       # No existe ninguna Route que matchee `/internal/*`: el endpoint
       # interno `/internal/verify-ownership` (Vehicle → Identity) no se
       # expone en Kong a propósito, y una request a través del proxy tiene
