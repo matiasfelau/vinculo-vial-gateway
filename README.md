@@ -47,6 +47,7 @@ de `/notifications/tokens` no tienen body relevante.
 | Ruteo declarativo a `notification-service` (`POST /notifications/tokens`, US-06) | ✅ |
 | Ruteo declarativo a `notification-service` (`DELETE /notifications/tokens`, US-06) | ✅ |
 | Ruteo y rate limiting por usuario en `GET /vehicles` (30/min), `POST /vehicles/unlink` (10/min, 30/hora) y `DELETE /vehicles` (3/min, 10/hora), US-14 | ✅ |
+| Ruteo declarativo a `benefits-service` y rate limiting por usuario en `GET /benefits` (60/min), `GET /benefits/{id}/banner` (120/min) y `POST /benefits/{id}/claim` (10/min, 30/hora), US-18 | ✅ |
 | Rate limiting global | ✅ |
 | Rate limiting por usuario en `/alerts` (5/min, 10/hora sobre `X-User-Id`) | ✅ |
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
@@ -57,11 +58,12 @@ de `/notifications/tokens` no tienen body relevante.
 | Atestación real contra Google Play Integrity | ✅ |
 | Ligadura con el body (`requestHash`) + anti-replay | ✅ |
 | `/auth/logout` exento de atestación (deliberado, ver más abajo) | ✅ |
-| `/alerts`, `/alerts/inbox`, `/notifications/tokens`, `DELETE /users/me` y las Routes de `/vehicles` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
-| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` (las 4 Routes), `/alerts`, `/alerts/inbox`, `/notifications/tokens` y `DELETE /users/me`) | ✅ |
+| `/alerts`, `/alerts/inbox`, `/notifications/tokens`, `DELETE /users/me`, las Routes de `/vehicles` y las de `/benefits` exentos de atestación (decisión cerrada del contrato desde US-05, ver más abajo) | ✅ |
+| Token offloading (`X-User-Hash` en el scaffold, `X-User-Id` en `/vehicles` (las 4 Routes), `/alerts`, `/alerts/inbox`, `/notifications/tokens`, `DELETE /users/me` y `/benefits` (las 3 Routes)) | ✅ |
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
+| `/admin/*` de Benefits sin Route en Kong (verificado con un 404 explícito, con y sin `X-Admin-Api-Key`) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 321 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
+| CI: 104 tests unitarios + 411 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
 
 ## Estructura
 
@@ -122,7 +124,12 @@ El Gateway se conecta a la red Docker **externa** `vinculo-vial` — no la crea
 él: es la red puente que comparte toda la plataforma, provista una única vez
 fuera de cualquier compose individual (ver el bootstrap de arriba). Ahí
 alcanza a Identity en `IDENTITY_SERVICE_URL`
-(`http://vinculo-vial-identity:8080` por defecto).
+(`http://vinculo-vial-identity:8080` por defecto) y, de la misma forma, a cada
+servicio detrás de una Route: `VEHICLE_SERVICE_URL`, `ALERT_SERVICE_URL`,
+`NOTIFICATION_SERVICE_URL` y `BENEFITS_SERVICE_URL` (US-18,
+`http://vinculo-vial-benefits:8080` por defecto, el puerto público `PORT` de
+Benefits; su router de administración no pasa por el Gateway). Las cinco son
+obligatorias: sin una de ellas el contenedor no arranca.
 
 > **Cada componente de la plataforma tiene que declarar esa misma red como
 > `external: true` y unirse a ella con un `container_name` de la forma
@@ -522,6 +529,67 @@ tres Routes sobre `vehicle-service`.
 - **Sin límite de tamaño propio** en `unlink`, igual que el alta vigente: lo
   acota el techo global de nginx (ver "Tamaño del payload").
 
+## Beneficios: `/benefits` (US-18)
+
+US-18 suma el servicio `vinculo-vial-benefits`: un partner (p. ej. una
+petrolera) entrega un lote de códigos de descuento de un solo uso por campaña y
+Vínculo Vial le asigna uno por persona. Benefits **no genera ni valida** los
+códigos, sólo los distribuye, y el partner nunca recibe datos de los usuarios.
+Para el Gateway es un Service nuevo (`benefits-service`, sobre `benefits-upstream`
+con healthcheck propio, apuntado por `BENEFITS_SERVICE_URL`) con tres Routes de
+sesión:
+
+| Route | Método y path | Plugins |
+|---|---|---|
+| `benefits-list-route` | `GET /api/v1/benefits` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 60/min por `X-User-Id`, `request-transformer` (quita `X-User-Hash`) |
+| `benefits-banner-route` | `GET /api/v1/benefits/{id}/banner` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 120/min por `X-User-Id`, `request-transformer` (quita `X-User-Hash`) |
+| `benefits-claim-route` | `POST /api/v1/benefits/{id}/claim` | `jwt`, `token-offloading` (`X-User-Id`), `rate-limiting` 10/min y 30/hora por `X-User-Id`, `request-transformer` (quita `X-User-Hash`) |
+
+- **Path exacto, regex anclada** (`~/api/v1/benefits$` y
+  `~/api/v1/benefits/[0-9a-fA-F-]{36}/{banner,claim}$`): no capturan barras
+  finales, subrecursos, ids que no sean un UUID ni paths con el mismo prefijo.
+  `GET /api/v1/benefits/{id}` (sin subrecurso) no existe en el contrato y da
+  404 de Kong. Los métodos que no son el de cada Route también dan 404.
+- **Orden de plugins:** `jwt`, después `token-offloading` (PRIORITY 1000) y
+  después `rate-limiting` (910) por `X-User-Id`, que ya está escrito cuando éste
+  lo lee. El cupo es independiente por usuario y por Route (agotar `claim` no
+  corta la lista ni los banners del mismo usuario) y, en `claim`, es por
+  usuario y no por campaña. Como cada Route declara su propio `rate-limiting`,
+  reemplaza al perimetral por IP (60/min), que no se suma: por eso el banner
+  puede llegar a 120/min.
+- **Sin `app-attestation`**, como `/vehicles`, `/alerts` y `/notifications`: la
+  defensa es el JWT más el rate limit por usuario. Se declara siempre por
+  Route, nunca por Service.
+- **`X-User-Id` y `X-User-Hash` forjados:** `token-offloading` descarta el
+  `X-User-Id` que mande el cliente y escribe el del `sub` del JWT; es la única
+  protección contra pedir (y gastar del pool) el código a nombre de otro
+  usuario. Como ese plugin no toca `X-User-Hash`, cada Route suma un
+  `request-transformer` que quita sólo ése (nunca `X-User-Id`: corre en 801,
+  después de `token-offloading`, y borraría el recién escrito). Es una
+  diferencia deliberada con las otras Routes con sesión, que dejan pasar un
+  `X-User-Hash` ajeno que ningún servicio lee. La suite lo verifica en las tres
+  Routes, junto con que el `Authorization` no llega a Benefits.
+- **Por qué esos límites.** La lista (60/min) y el banner (120/min) son
+  lecturas sin efectos; el banner es el doble porque cada carga de la lista
+  dispara un pedido por campaña (y la app revalida por `ETag`, con `304`).
+  `claim` es lo único que gasta el pool y responde `404 BENEFIT_NOT_FOUND` o
+  `409 NO_CODES_LEFT`, así que se acota fuerte; el uso legítimo es un pedido
+  por campaña, porque es idempotente (el mismo usuario recibe siempre el mismo
+  código).
+- **Las respuestas se reenvían sin transformar:** la lista y `claim` pueden
+  llevar el código del usuario, y el banner conserva `Content-Type`, `ETag` y
+  `Cache-Control` de Benefits. Los errores (`BENEFIT_NOT_FOUND` 404,
+  `NO_CODES_LEFT` 409, `DEPENDENCY_UNAVAILABLE` 503 con `Retry-After`) son de
+  Benefits. El Gateway no loguea bodies, así que ningún código aparece en sus
+  logs.
+- **`/admin/*` y `/internal/*` no existen en Kong.** El router de administración
+  de Benefits (`HTTP_ADMIN_PORT`, `X-Admin-Api-Key`: campañas, carga de
+  códigos, canjes y estadísticas) no tiene Route: una request a través del
+  proxy da 404 de Kong, con o sin la clave, y no llega a la red interna.
+- **Timeouts:** mismo presupuesto que `vehicle-service` (ver "Presupuesto de
+  latencia"), con `retries: 1`: `claim` es idempotente y las otras dos son
+  lecturas, así que reintentar ante un fallo de conexión es inofensivo.
+
 ## Escaneo de Patente: `/alerts` (US-05)
 
 Mismo perímetro base que `/vehicles`: `jwt` verifica el Access Token y
@@ -877,7 +945,7 @@ para interceptar la respuesta nativa de Kong (ver nota siguiente).
 > error de Kong y queda fuera de alcance.
 >
 > Un upstream interno (`identity-service`, `vehicle-service`, `alert-service`,
-> `notification-service`) que no responde dentro de su `read_timeout` recibe
+> `notification-service`, `benefits-service`) que no responde dentro de su `read_timeout` recibe
 > `504` de Kong — no `503` — porque el proxy nativo de Kong, a diferencia del
 > cliente HTTP propio que usa `app-attestation` contra Google, no ofrece un
 > punto donde reclasificar ese código antes de responder. Es una excepción
@@ -900,12 +968,12 @@ integración, ver "Resiliencia (K2)").
 | `vehicle-service` | 1000 | 9000 | 9000 | 11000 |
 | `alert-service` | 1000 | 9000 | 9000 | 11000 |
 | `notification-service` | 1000 | 9000 | 9000 | 11000 |
+| `benefits-service` | 1000 | 9000 | 9000 | 11000 |
 
 `identity-service` queda más ajustado porque sus Routes (`/auth/signup`,
 `/auth/signin`, `/auth/refresh`) además cargan `app-attestation`, que reparte
 el resto del presupuesto (hasta 4000ms) contra Google: `8000 + 4000 = 12000`.
-Las otras tres Routes no tienen esa dependencia y usan el presupuesto
-completo.
+Las otras Routes no tienen esa dependencia y usan el presupuesto completo.
 
 Dentro de `app-attestation`, el canje de OAuth y el POST a
 `decodeIntegrityToken` comparten un presupuesto agregado de 4000ms
@@ -918,8 +986,8 @@ sola agotar el presupuesto del par.
 
 ## Healthchecks de los upstreams
 
-Los cuatro Services (`identity-service`, `vehicle-service`, `alert-service`,
-`notification-service`) resuelven contra un `Upstream` propio con dos
+Los cinco Services (`identity-service`, `vehicle-service`, `alert-service`,
+`notification-service`, `benefits-service`) resuelven contra un `Upstream` propio con dos
 healthchecks, no uno. La salud de la instancia la decide el activo:
 
 - **Activo**, contra `GET /ready` de cada servicio, directo al target — por

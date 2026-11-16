@@ -433,6 +433,7 @@ docker run -d --name "${GATEWAY}" --network "${NETWORK}" \
   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080" \
+  -e "BENEFITS_SERVICE_URL=http://${UPSTREAM}:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
@@ -1208,7 +1209,7 @@ echo "Rutas de US-09: detrás de un proxy (KONG_TRUSTED_IPS)"
 # contenedor: su peer es 127.0.0.1, que es lo que se declara de confianza.
 # Con la lista vacía (el Gateway principal) el header del cliente se ignora.
 echo "==> Levantando un Gateway con KONG_TRUSTED_IPS"
-docker run -d --name "${GATEWAY_PROXY}" --network "${NETWORK}"   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")"   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro"   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080"   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080"   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080"   -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080"   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080"   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}"   -e ATTESTATION_SOURCE=google   -e ATTESTATION_SSL_VERIFY=false   -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}"   -e "JWT_ISSUER=${JWT_ISSUER}"   -e "KONG_TRUSTED_IPS=127.0.0.1/32"   vinculo-vial-gateway:integration >/dev/null
+docker run -d --name "${GATEWAY_PROXY}" --network "${NETWORK}"   --env-file "$(to_host_path "${REPO_ROOT}/.env.example")"   -v "$(to_host_path "${sa_dir}/google-service-account.json"):/etc/vinculo-vial/google-service-account.json:ro"   -e "IDENTITY_SERVICE_URL=http://${UPSTREAM}:8080"   -e "VEHICLE_SERVICE_URL=http://${UPSTREAM}:8080"   -e "ALERT_SERVICE_URL=http://${UPSTREAM}:8080"   -e "NOTIFICATION_SERVICE_URL=http://${UPSTREAM}:8080"   -e "BENEFITS_SERVICE_URL=http://${UPSTREAM}:8080"   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080"   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}"   -e ATTESTATION_SOURCE=google   -e ATTESTATION_SSL_VERIFY=false   -e "JWT_PUBLIC_KEY=${jwt_public_key_escaped}"   -e "JWT_ISSUER=${JWT_ISSUER}"   -e "KONG_TRUSTED_IPS=127.0.0.1/32"   vinculo-vial-gateway:integration >/dev/null
 
 for _ in $(seq 1 30); do
   if docker exec "${GATEWAY_PROXY}" curl -sf http://127.0.0.1:8100/status >/dev/null 2>&1; then
@@ -1632,6 +1633,301 @@ check "con DELETE agotado, el mismo usuario sigue pudiendo hacer unlink" \
   200 "$(route_status POST "${u14_unlink}" "${u14_rl_all}")"
 
 echo
+echo "Beneficios (US-18): matriz de ruteo (lista, banner y claim)"
+
+# Cada Route de US-18 declara su propio `rate-limiting` y Kong expone su límite
+# en `X-RateLimit-Limit-*`: es lo que identifica QUÉ Route atendió el request.
+# Sólo los requests ruteados gastan cupo (un 404 de Kong o un 401 cortan antes),
+# así que cada grupo usa su propio usuario.
+u18_list="/api/v1/benefits"
+u18_id="0f1e2d3c-4b5a-4968-8776-655443322110"
+u18_banner="/api/v1/benefits/${u18_id}/banner"
+u18_claim="/api/v1/benefits/${u18_id}/claim"
+u18_token_for() {
+  sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"$1\",\"exp\":$((now + 300))}"
+}
+u18_list_user="b1c2d3e4-0001-4a5b-8c6d-7e8f9a0b1c2d"
+u18_banner_user="b1c2d3e4-0002-4a5b-8c6d-7e8f9a0b1c2d"
+u18_claim_user="b1c2d3e4-0003-4a5b-8c6d-7e8f9a0b1c2d"
+u18_list_token="$(u18_token_for "${u18_list_user}")"
+u18_banner_token="$(u18_token_for "${u18_banner_user}")"
+u18_claim_token="$(u18_token_for "${u18_claim_user}")"
+
+u18_list_headers="$(route_headers GET "${u18_list}" "${u18_list_token}")"
+check_contains "GET /api/v1/benefits → benefits-list-route" \
+  "http/1.1 200" "${u18_list_headers}"
+check_contains "GET /api/v1/benefits lo atiende benefits-list-route (60/min)" \
+  "x-ratelimit-limit-minute: 60" "${u18_list_headers}"
+check_not_contains "GET /api/v1/benefits no tiene tope por hora" \
+  "x-ratelimit-limit-hour" "${u18_list_headers}"
+
+u18_banner_headers="$(route_headers GET "${u18_banner}" "${u18_banner_token}")"
+check_contains "GET /api/v1/benefits/{id}/banner → benefits-banner-route" \
+  "http/1.1 200" "${u18_banner_headers}"
+check_contains "GET /api/v1/benefits/{id}/banner lo atiende benefits-banner-route (120/min)" \
+  "x-ratelimit-limit-minute: 120" "${u18_banner_headers}"
+check_not_contains "GET /api/v1/benefits/{id}/banner no tiene tope por hora" \
+  "x-ratelimit-limit-hour" "${u18_banner_headers}"
+
+u18_claim_headers="$(route_headers POST "${u18_claim}" "${u18_claim_token}")"
+check_contains "POST /api/v1/benefits/{id}/claim → benefits-claim-route" \
+  "http/1.1 200" "${u18_claim_headers}"
+check_contains "POST /api/v1/benefits/{id}/claim lo atiende benefits-claim-route (10/min)" \
+  "x-ratelimit-limit-minute: 10" "${u18_claim_headers}"
+check_contains "POST /api/v1/benefits/{id}/claim lo atiende benefits-claim-route (30/h)" \
+  "x-ratelimit-limit-hour: 30" "${u18_claim_headers}"
+
+# El id es un UUID en minúsculas o mayúsculas.
+check "el {id} en mayúsculas también se rutea: banner" \
+  200 "$(route_status GET "/api/v1/benefits/0F1E2D3C-4B5A-4968-8776-655443322110/banner" "$(u18_token_for "b1c2d3e4-0004-4a5b-8c6d-7e8f9a0b1c2d")")"
+
+# Los demás métodos no tienen Route en ninguno de los tres paths.
+u18_probe="$(u18_token_for "b1c2d3e4-0005-4a5b-8c6d-7e8f9a0b1c2d")"
+for method in POST PUT PATCH DELETE; do
+  check "${method} /api/v1/benefits (método sin Route) → 404" \
+    404 "$(route_status "${method}" "${u18_list}" "${u18_probe}")"
+done
+for method in POST PUT PATCH DELETE; do
+  check "${method} /api/v1/benefits/{id}/banner (método sin Route) → 404" \
+    404 "$(route_status "${method}" "${u18_banner}" "${u18_probe}")"
+done
+for method in GET PUT PATCH DELETE; do
+  check "${method} /api/v1/benefits/{id}/claim (método sin Route) → 404" \
+    404 "$(route_status "${method}" "${u18_claim}" "${u18_probe}")"
+done
+
+echo
+echo "Beneficios (US-18): path exacto"
+
+# Regex anclada con `$`: ninguna Route captura barras finales, subrecursos,
+# ids que no son un UUID ni paths que sólo comparten prefijo.
+check "GET /api/v1/benefits/ (barra final) → 404" \
+  404 "$(route_status GET "${u18_list}/" "${u18_probe}")"
+check "GET /api/v1/benefits/extra → 404" \
+  404 "$(route_status GET "${u18_list}/extra" "${u18_probe}")"
+check "GET /api/v1/benefits/{id} (sin subrecurso) → 404" \
+  404 "$(route_status GET "${u18_list}/${u18_id}" "${u18_probe}")"
+check "GET /api/v1/benefitsx (mismo prefijo) → 404" \
+  404 "$(route_status GET /api/v1/benefitsx "${u18_probe}")"
+check "GET /api/v1/benefits/{id}/banner/ (barra final) → 404" \
+  404 "$(route_status GET "${u18_banner}/" "${u18_probe}")"
+check "GET /api/v1/benefits/{id}/banner/extra → 404" \
+  404 "$(route_status GET "${u18_banner}/extra" "${u18_probe}")"
+check "GET /api/v1/benefits/{id}/bannerx (mismo prefijo) → 404" \
+  404 "$(route_status GET "${u18_banner}x" "${u18_probe}")"
+check "GET /api/v1/benefits/{id}/x/banner → 404" \
+  404 "$(route_status GET "/api/v1/benefits/${u18_id}/x/banner" "${u18_probe}")"
+check "GET /api/v1/benefits/no-es-un-uuid/banner → 404" \
+  404 "$(route_status GET /api/v1/benefits/no-es-un-uuid/banner "${u18_probe}")"
+check "POST /api/v1/benefits/{id}/claim/ (barra final) → 404" \
+  404 "$(route_status POST "${u18_claim}/" "${u18_probe}")"
+check "POST /api/v1/benefits/{id}/claim/extra → 404" \
+  404 "$(route_status POST "${u18_claim}/extra" "${u18_probe}")"
+check "POST /api/v1/benefits/{id}/claimx (mismo prefijo) → 404" \
+  404 "$(route_status POST "${u18_claim}x" "${u18_probe}")"
+check "POST /api/v1/benefits/no-es-un-uuid/claim → 404" \
+  404 "$(route_status POST /api/v1/benefits/no-es-un-uuid/claim "${u18_probe}")"
+check "POST /api/v1/benefits/claim (sin id) → 404" \
+  404 "$(route_status POST /api/v1/benefits/claim "${u18_probe}")"
+
+echo
+echo "Beneficios (US-18): /admin/* no se alcanza por Kong"
+
+# El router de administración de Benefits (puerto propio, `X-Admin-Api-Key`) no
+# tiene Route: el 404 es de Kong, aun con un JWT válido y aun con la clave.
+for method in GET POST; do
+  check "${method} /admin/v1/campaigns → 404 de Kong" \
+    404 "$(route_status "${method}" /admin/v1/campaigns "${u18_probe}")"
+done
+check "PATCH /admin/v1/campaigns/{id} → 404 de Kong" \
+  404 "$(route_status PATCH "/admin/v1/campaigns/${u18_id}" "${u18_probe}")"
+check "PUT /admin/v1/campaigns/{id}/banner → 404 de Kong" \
+  404 "$(route_status PUT "/admin/v1/campaigns/${u18_id}/banner" "${u18_probe}")"
+check "POST /admin/v1/campaigns/{id}/codes → 404 de Kong" \
+  404 "$(route_status POST "/admin/v1/campaigns/${u18_id}/codes" "${u18_probe}")"
+check "POST /admin/v1/campaigns/{id}/redemptions → 404 de Kong" \
+  404 "$(route_status POST "/admin/v1/campaigns/${u18_id}/redemptions" "${u18_probe}")"
+check "GET /admin/v1/campaigns/{id}/stats → 404 de Kong" \
+  404 "$(route_status GET "/admin/v1/campaigns/${u18_id}/stats" "${u18_probe}")"
+check "GET /admin/v1/campaigns con X-Admin-Api-Key → 404 de Kong" \
+  404 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X GET http://127.0.0.1:8000/admin/v1/campaigns \
+    -H 'X-Admin-Api-Key: una-clave-de-administracion-de-32-caracteres')"
+check "GET /api/v1/benefits/admin/v1/campaigns → 404" \
+  404 "$(route_status GET /api/v1/benefits/admin/v1/campaigns "${u18_probe}")"
+check "GET /internal/benefits → 404 de Kong" \
+  404 "$(route_status GET /internal/benefits "${u18_probe}")"
+
+echo
+echo "Beneficios (US-18): seguridad (JWT y Token Offloading)"
+
+# Cada Route exige un JWT válido: sin Authorization, mal formado, vencido o con
+# un `iss` sin consumer registrado se corta con 401 antes de llegar a Benefits.
+u18_expired="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"sub\":\"${u18_probe}\",\"exp\":$((now - 300))}")"
+u18_wrong_iss="$(sign_jwt "{\"iss\":\"otro-emisor\",\"sub\":\"${u18_list_user}\",\"exp\":$((now + 300))}")"
+
+u18_ph="{id}"
+u18_paths=("GET ${u18_list}" "GET ${u18_banner}" "POST ${u18_claim}")
+for entry in "${u18_paths[@]}"; do
+  method="${entry%% *}"
+  path="${entry#* }"
+  label="${method} ${path/${u18_id}/${u18_ph}}"
+
+  check "sin Authorization, 401: ${label}" \
+    401 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X "${method}" "http://127.0.0.1:8000${path}")"
+  check "JWT mal formado, 401: ${label}" \
+    401 "$(route_status "${method}" "${path}" "no-es-un-jwt")"
+  check "JWT expirado, 401: ${label}" \
+    401 "$(route_status "${method}" "${path}" "${u18_expired}")"
+  check "JWT con un iss sin consumer registrado, 401: ${label}" \
+    401 "$(route_status "${method}" "${path}" "${u18_wrong_iss}")"
+done
+
+# Un JWT sin `sub` no deja derivar la identidad: se corta en el perímetro.
+u18_no_sub="$(sign_jwt "{\"iss\":\"${JWT_ISSUER}\",\"exp\":$((now + 300))}")"
+check "JWT sin sub, 401: POST /benefits/{id}/claim" \
+  401 "$(route_status POST "${u18_claim}" "${u18_no_sub}")"
+
+# Con un JWT válido, Benefits recibe `X-User-Id` con el `sub` y no recibe el
+# `Authorization`. Un `X-User-Id` o un `X-User-Hash` forjado por el cliente no
+# llega: es la única protección contra pedir el código a nombre de otro.
+u18_view() {
+  local method="$1" path="$2" token="$3"
+
+  docker exec "${GATEWAY}" curl -s \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${token}" \
+    -H 'X-User-Id: usuario-suplantado' \
+    -H 'X-User-Hash: hash-suplantado' \
+    -H 'Content-Type: application/json' \
+    --data-binary '{}' | tr '[:upper:]' '[:lower:]'
+}
+u18_check_view() {
+  local label="$1" user="$2" view="$3"
+
+  check_contains "X-User-Id del JWT llega al upstream: ${label}" \
+    "\"x-user-id\": \"${user}\"" "${view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${label}" \
+    "usuario-suplantado" "${view}"
+  check_not_contains "el X-User-Hash forjado se descarta: ${label}" \
+    "hash-suplantado" "${view}"
+  check_not_contains "el Authorization no se propaga: ${label}" \
+    "authorization" "${view}"
+}
+u18_check_view "GET /benefits" "${u18_list_user}" \
+  "$(u18_view GET "${u18_list}" "${u18_list_token}")"
+u18_check_view "GET /benefits/{id}/banner" "${u18_banner_user}" \
+  "$(u18_view GET "${u18_banner}" "${u18_banner_token}")"
+u18_check_view "POST /benefits/{id}/claim" "${u18_claim_user}" \
+  "$(u18_view POST "${u18_claim}" "${u18_claim_token}")"
+
+# El path con el id llega intacto al upstream (`strip_path: false`).
+check_contains "el path del banner llega intacto a Benefits" \
+  "${u18_banner}" "$(u18_view GET "${u18_banner}" "${u18_banner_token}")"
+
+# El Gateway no loguea bodies ni headers de sesión: el JWT no puede aparecer en
+# sus logs.
+check_not_contains "el JWT del usuario no aparece en los logs del Gateway" \
+  "${u18_claim_token}" "$(docker logs "${GATEWAY}" 2>&1)"
+
+echo
+echo "Beneficios (US-18): las respuestas de Benefits se propagan"
+
+# El upstream de eco devuelve el status que pide `x-set-response-status-code`.
+# El Gateway no transforma las respuestas de estas Routes: el 304 del banner,
+# el 409 `NO_CODES_LEFT` y el 404 `BENEFIT_NOT_FOUND` llegan tal cual.
+u18_status_token="$(u18_token_for "b1c2d3e4-0007-4a5b-8c6d-7e8f9a0b1c2d")"
+u18_forced_status() {
+  local method="$1" path="$2" code="$3"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X "${method}" "http://127.0.0.1:8000${path}" \
+    -H "Authorization: Bearer ${u18_status_token}" \
+    -H 'Content-Type: application/json' \
+    -H "x-set-response-status-code: ${code}" \
+    --data-binary '{}'
+}
+check "el 304 del banner se propaga" \
+  304 "$(u18_forced_status GET "${u18_banner}" 304)"
+check "el 404 BENEFIT_NOT_FOUND del banner se propaga" \
+  404 "$(u18_forced_status GET "${u18_banner}" 404)"
+check "el 404 BENEFIT_NOT_FOUND de claim se propaga" \
+  404 "$(u18_forced_status POST "${u18_claim}" 404)"
+check "el 409 NO_CODES_LEFT de claim se propaga" \
+  409 "$(u18_forced_status POST "${u18_claim}" 409)"
+check "el 503 DEPENDENCY_UNAVAILABLE de la lista se propaga" \
+  503 "$(u18_forced_status GET "${u18_list}" 503)"
+
+echo
+echo "Beneficios (US-18): rate limiting por X-User-Id"
+
+# Mismo guard de reloj que el de US-09, US-11 y US-14: la ventana fija del
+# contador `local` se alinea al minuto de reloj y, si la ráfaga la cruzara, se
+# reiniciaría y enmascararía el corte esperado.
+#
+# `u18_burst` hace `count` requests en una sola ejecución dentro del
+# contenedor y devuelve el status de la última: la ráfaga de 120 del banner no
+# entra en un minuto si cada request es un `docker exec` propio.
+u18_burst() {
+  local method="$1" path="$2" token="$3" count="$4"
+
+  docker exec "${GATEWAY}" sh -c "
+    last=
+    i=0
+    while [ \$i -lt ${count} ]; do
+      last=\$(curl -s -o /dev/null -w '%{http_code}' -X ${method} 'http://127.0.0.1:8000${path}' \
+        -H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' --data-binary '{}')
+      i=\$((i + 1))
+    done
+    printf '%s' \"\$last\""
+}
+
+u9_wait_clock_minute 35
+
+u18_rl_list="$(u18_token_for "b1c2d3e4-0101-4a5b-8c6d-7e8f9a0b1c2d")"
+u18_rl_other="$(u18_token_for "b1c2d3e4-0102-4a5b-8c6d-7e8f9a0b1c2d")"
+
+# Si la lista cayera en una Route de 10/min, esta ráfaga habría fallado mucho
+# antes del sexagésimo.
+check "el request 60 de GET /benefits en el minuto todavía pasa" \
+  200 "$(u18_burst GET "${u18_list}" "${u18_rl_list}" 60)"
+check "el request 61 de GET /benefits en el minuto → 429" \
+  429 "$(route_status GET "${u18_list}" "${u18_rl_list}")"
+check "otro usuario no comparte el contador de GET /benefits" \
+  200 "$(route_status GET "${u18_list}" "${u18_rl_other}")"
+
+u9_wait_clock_minute 30
+
+u18_rl_banner="$(u18_token_for "b1c2d3e4-0103-4a5b-8c6d-7e8f9a0b1c2d")"
+# Si el banner cayera en la Route de la lista (60/min), la ráfaga habría
+# fallado en el request 61.
+check "el request 120 del banner en el minuto todavía pasa" \
+  200 "$(u18_burst GET "${u18_banner}" "${u18_rl_banner}" 120)"
+check "el request 121 del banner en el minuto → 429" \
+  429 "$(route_status GET "${u18_banner}" "${u18_rl_banner}")"
+check "otro usuario no comparte el contador del banner" \
+  200 "$(route_status GET "${u18_banner}" "${u18_rl_other}")"
+# El cupo es por Route: agotar el banner no corta la lista del mismo usuario.
+check "con el banner agotado, el mismo usuario sigue pudiendo pedir la lista" \
+  200 "$(route_status GET "${u18_list}" "${u18_rl_banner}")"
+
+u9_wait_clock_minute 45
+
+u18_rl_claim="$(u18_token_for "b1c2d3e4-0104-4a5b-8c6d-7e8f9a0b1c2d")"
+check "el request 10 de claim en el minuto todavía pasa" \
+  200 "$(u18_burst POST "${u18_claim}" "${u18_rl_claim}" 10)"
+check "el request 11 de claim en el minuto → 429" \
+  429 "$(route_status POST "${u18_claim}" "${u18_rl_claim}")"
+check "otro usuario no comparte el contador de claim" \
+  200 "$(route_status POST "${u18_claim}" "${u18_rl_other}")"
+# El cupo de claim es por usuario, no por campaña: otro id lo consume igual.
+check "el cupo de claim es por usuario: otro {id} también da 429" \
+  429 "$(route_status POST "/api/v1/benefits/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/claim" "${u18_rl_claim}")"
+check "con claim agotado, el mismo usuario sigue pudiendo pedir la lista" \
+  200 "$(route_status GET "${u18_list}" "${u18_rl_claim}")"
+
+echo
 echo "Buzón de Alertas (US-07): JWT y Token Offloading en /alerts/inbox"
 
 # Mismo usuario que en las secciones anteriores: el rate-limiting de esta
@@ -1887,6 +2183,7 @@ docker run -d --name "${GATEWAY_SLOW}" --network "${NETWORK}" \
   -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
   -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
   -e "NOTIFICATION_SERVICE_URL=http://${SLOW_UPSTREAM}:8080" \
+  -e "BENEFITS_SERVICE_URL=http://benefits.invalid:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
@@ -1953,6 +2250,7 @@ docker run -d --name "${GATEWAY_RESILIENCE}" --network "${NETWORK}" \
   -e "VEHICLE_SERVICE_URL=http://vehicle.invalid:8080" \
   -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
   -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "BENEFITS_SERVICE_URL=http://benefits.invalid:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
@@ -2176,6 +2474,7 @@ docker run -d --name "${GATEWAY_PASSIVE}" --network "${NETWORK}" \
   -e "VEHICLE_SERVICE_URL=http://${LATE_UPSTREAM}:8080" \
   -e "ALERT_SERVICE_URL=http://alert.invalid:8080" \
   -e "NOTIFICATION_SERVICE_URL=http://${FLAKY_UPSTREAM}:8080" \
+  -e "BENEFITS_SERVICE_URL=http://benefits.invalid:8080" \
   -e "PLAY_INTEGRITY_URL=http://${STUB}:8080" \
   -e "PLAY_PACKAGE_NAME=${PACKAGE_NAME}" \
   -e ATTESTATION_SOURCE=google \
