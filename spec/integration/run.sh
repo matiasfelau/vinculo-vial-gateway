@@ -1366,6 +1366,193 @@ check "otro usuario no comparte el contador de la baja" \
   200 "$(route_status DELETE "${u11_me}" "${u11_rl_other}")"
 
 echo
+echo "Email y recuperación de contraseña (US-13): rutas públicas"
+
+# Cinco Routes sin `jwt`, con el perímetro de signup/signin (descarte de
+# `X-User-Hash`/`X-User-Id`, `app-attestation`, techo de body y rate limit por
+# IP). Cada Route de 3/min atiende como máximo 3 requests de esta sección por
+# ventana: por eso cada request cumple varios chequeos a la vez y la sección
+# arranca con un guard de reloj.
+u13_routes=(
+  "/api/v1/auth/email-verifications|3|10"
+  "/api/v1/auth/email-verifications/confirm|10|30"
+  "/api/v1/auth/password-resets|3|10"
+  "/api/v1/auth/password-resets/confirm|10|30"
+  "/api/v1/auth/password-resets/complete|3|10"
+)
+
+# POST con una atestación válida ligada a un body propio (el anti-replay
+# rechazaría un body repetido). Devuelve status y headers en minúsculas, y
+# después el eco del upstream. Los argumentos extra van directo a curl.
+u13_post_full() {
+  local path="$1"; shift
+  local body="{\"ephemeral_public_key\":\"U13$(date +%s%N)${RANDOM}\",\"ciphertext\":\"CCCC\"}"
+
+  docker exec "${GATEWAY}" curl -s -D - -X POST "http://127.0.0.1:8000${path}" \
+    -H "X-App-Attestation: $(body_hash "${body}")" \
+    -H 'Content-Type: application/json' "$@" \
+    --data-binary "${body}" | tr '[:upper:]' '[:lower:]'
+}
+
+u13_post() {
+  local path="$1" body="{\"ephemeral_public_key\":\"U13$(date +%s%N)${RANDOM}\",\"ciphertext\":\"CCCC\"}"
+
+  docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+    -X POST "http://127.0.0.1:8000${path}" \
+    -H "X-App-Attestation: $(body_hash "${body}")" \
+    -H 'Content-Type: application/json' \
+    --data-binary "${body}"
+}
+
+# Body de `bytes` bytes con una atestación que no hace falta que sea válida: lo
+# que se mide es si el techo de la Route lo corta (413) o lo deja llegar a la
+# atestación (403).
+u13_sized_status() {
+  local path="$1" bytes="$2"
+
+  docker exec "${GATEWAY}" sh -c "
+    head -c ${bytes} /dev/urandom > /tmp/u13.bin
+    curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:8000${path}' \
+      -H 'X-App-Attestation: no-hace-falta-que-sea-valido' \
+      -H 'Content-Type: application/octet-stream' -H 'Expect:' \
+      --data-binary @/tmp/u13.bin
+    true"
+}
+
+u9_wait_clock_minute 30
+
+for u13_entry in "${u13_routes[@]}"; do
+  IFS='|' read -r u13_path u13_minute u13_hour <<< "${u13_entry}"
+
+  # Un solo request: ruteo, cupo propio, atestación válida, descarte de los
+  # headers de identidad forjados y body intacto.
+  u13_view="$(u13_post_full "${u13_path}" \
+    -H 'X-User-Id: usuario-suplantado' -H 'X-User-Hash: hash-suplantado')"
+
+  check_contains "POST ${u13_path} con atestación válida llega al upstream" \
+    "http/1.1 200" "${u13_view}"
+  check_contains "POST ${u13_path} lo atiende su propia Route (${u13_minute}/min)" \
+    "x-ratelimit-limit-minute: ${u13_minute}" "${u13_view}"
+  check_contains "POST ${u13_path} lo atiende su propia Route (${u13_hour}/h)" \
+    "x-ratelimit-limit-hour: ${u13_hour}" "${u13_view}"
+  check_not_contains "el X-User-Id forjado se descarta: ${u13_path}" \
+    "usuario-suplantado" "${u13_view}"
+  check_not_contains "el X-User-Hash forjado se descarta: ${u13_path}" \
+    "hash-suplantado" "${u13_view}"
+  check_not_contains "el token de atestación no se propaga: ${u13_path}" \
+    "x-app-attestation" "${u13_view}"
+  check_contains "el body llega intacto al upstream: ${u13_path}" \
+    "cccc" "${u13_view}"
+done
+
+echo
+echo "Email y recuperación de contraseña (US-13): atestación obligatoria"
+
+u13_google_before="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+for u13_entry in "${u13_routes[@]}"; do
+  IFS='|' read -r u13_path _ _ <<< "${u13_entry}"
+  check "sin header de atestación, 403: ${u13_path}" \
+    403 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X POST "http://127.0.0.1:8000${u13_path}" -d '{}')"
+done
+u13_google_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+check "el rechazo sin header no llama a Google" \
+  "${u13_google_before}" "${u13_google_after}"
+
+echo
+echo "Email y recuperación de contraseña (US-13): path exacto"
+
+# Un path de prefijo capturaría el subrecurso con el cupo y el techo del padre.
+for u13_path in \
+  /api/v1/auth/email-verifications/ \
+  /api/v1/auth/email-verifications/extra \
+  /api/v1/auth/email-verifications/confirm/ \
+  /api/v1/auth/email-verifications/confirm/extra \
+  /api/v1/auth/password-resets/ \
+  /api/v1/auth/password-resets/extra \
+  /api/v1/auth/password-resets/confirm/ \
+  /api/v1/auth/password-resets/complete/ \
+  /api/v1/auth/password-resetsx; do
+  check "POST ${u13_path} (path sin Route) → 404" 404 "$(u13_post "${u13_path}")"
+done
+
+for u13_entry in "${u13_routes[@]}"; do
+  IFS='|' read -r u13_path _ _ <<< "${u13_entry}"
+  check "GET ${u13_path} (método sin Route) → 404" \
+    404 "$(docker exec "${GATEWAY}" curl -s -o /dev/null -w '%{http_code}' \
+      -X GET "http://127.0.0.1:8000${u13_path}")"
+done
+
+echo
+echo "Email y recuperación de contraseña (US-13): límite de tamaño"
+
+# 413 de Kong: corta antes de `rate-limiting` y de `app-attestation`.
+# SIGNIN_MAX_BODY_KB = 64 KB en las cuatro rutas de códigos; la selfie de
+# `complete` usa SIGNUP_MAX_BODY_MB = 5 MB.
+for u13_path in \
+  /api/v1/auth/email-verifications \
+  /api/v1/auth/email-verifications/confirm \
+  /api/v1/auth/password-resets \
+  /api/v1/auth/password-resets/confirm; do
+  check "un body de 64KB+1 se rechaza: ${u13_path}" \
+    413 "$(u13_sized_status "${u13_path}" 65537)"
+done
+check "un body de 64KB+1 no se rechaza en complete (techo de signup, llega a la atestación)" \
+  403 "$(u13_sized_status /api/v1/auth/password-resets/complete 65537)"
+check "un body de 6MB (> SIGNUP_MAX_BODY_MB) se rechaza en complete" \
+  413 "$(u13_sized_status /api/v1/auth/password-resets/complete 6291456)"
+
+echo
+echo "Email y recuperación de contraseña (US-13): rate limiting por IP"
+
+# Ráfaga de `count` requests con atestación válida y body propio, corrida
+# dentro del contenedor en un solo `docker exec`: así entra holgada en la ventana
+# del minuto. Devuelve los status en orden, separados por espacios.
+u13_burst() {
+  docker exec -i "${GATEWAY}" sh -s -- "$1" "$2" <<'SH'
+path="$1"; count="$2"; i=0
+while [ "${i}" -lt "${count}" ]; do
+  i=$((i + 1))
+  suffix="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  body="{\"ephemeral_public_key\":\"U13-${suffix}\",\"ciphertext\":\"CCCC\"}"
+  hash="$(printf '%s' "${body}" | sha256sum | cut -d' ' -f1)"
+  curl -s -o /dev/null -w '%{http_code} ' -X POST "http://127.0.0.1:8000${path}" \
+    -H "X-App-Attestation: ${hash}" -H 'Content-Type: application/json' \
+    --data-binary "${body}"
+done
+SH
+}
+
+# Ventana limpia: los contadores `local` se alinean al minuto de reloj. Cada
+# Route tiene su contador, así que las cinco ráfagas conviven en la misma
+# ventana sin pisarse.
+u9_wait_clock_minute 0
+
+check "email-verifications: 3 pasan y la 4 → 429 (3/min)" \
+  "200 200 200 429 " "$(u13_burst /api/v1/auth/email-verifications 4)"
+check "email-verifications/confirm: 10 pasan y la 11 → 429 (10/min)" \
+  "200 200 200 200 200 200 200 200 200 200 429 " \
+  "$(u13_burst /api/v1/auth/email-verifications/confirm 11)"
+check "password-resets: 3 pasan y la 4 → 429 (3/min)" \
+  "200 200 200 429 " "$(u13_burst /api/v1/auth/password-resets 4)"
+check "password-resets/confirm: 10 pasan y la 11 → 429 (10/min)" \
+  "200 200 200 200 200 200 200 200 200 200 429 " \
+  "$(u13_burst /api/v1/auth/password-resets/confirm 11)"
+check "password-resets/complete: 3 pasan y la 4 → 429 (3/min)" \
+  "200 200 200 429 " "$(u13_burst /api/v1/auth/password-resets/complete 4)"
+
+# Con el cupo agotado, el 429 corta antes de `app-attestation` (la prioridad de
+# `rate-limiting` es mayor): no gasta una llamada a Google.
+u13_google_before="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+u13_limited="$(u13_post_full /api/v1/auth/email-verifications)"
+u13_google_after="$(docker logs "${STUB}" 2>&1 | grep -c 'decodeIntegrityToken' || true)"
+check_contains "con el cupo agotado, el request siguiente → 429" \
+  "http/1.1 429" "${u13_limited}"
+check_contains "el 429 informa cuándo reintentar" "retry-after" "${u13_limited}"
+check "el 429 corta antes de la atestación: no llama a Google" \
+  "${u13_google_before}" "${u13_google_after}"
+
+echo
 echo "Vinculación por dominio (US-14): matriz de ruteo (conteo, unlink y unlink-all)"
 
 # Cada Route de US-14 declara su propio `rate-limiting` y Kong expone su límite

@@ -12,10 +12,13 @@ Expone `POST /api/v1/auth/signup` (US-01, Registro), `POST /api/v1/auth/signin`
 Alerta Anónima) + `GET /api/v1/alerts/inbox` (US-07, Buzón de Alertas) hacia
 `vinculo-vial-alert`, `POST` + `DELETE /api/v1/notifications/tokens` (US-06,
 Registro y Baja de Tokens FCM) hacia `vinculo-vial-notification`, y `DELETE
-/api/v1/users/me` (US-11, Baja de Cuenta) hacia `vinculo-vial-identity`. Valida **App
+/api/v1/users/me` (US-11, Baja de Cuenta) hacia `vinculo-vial-identity`. Desde
+US-13 suma cinco `POST` públicos hacia `vinculo-vial-identity`, sin sesión y con
+el perímetro de signup/signin: `/api/v1/auth/email-verifications` (+ `/confirm`)
+y `/api/v1/auth/password-resets` (+ `/confirm` y `/complete`). Valida **App
 Attestation** (`X-App-Attestation`, contra Google Play Integrity) en signup,
-signin y refresh antes de permitir tráfico hacia la red interna — **logout es
-la única excepción deliberada** (ver más abajo). El resto de las Routes usa un
+signin, refresh y esas cinco rutas de US-13 antes de permitir tráfico hacia la
+red interna — **logout es la única excepción deliberada** (ver más abajo). El resto de las Routes usa un
 perímetro distinto: **Token Offloading** real — Kong verifica el Access Token
 (JWT RS256) y traduce el claim `sub` al header `X-User-Id`, para que el
 upstream nunca vea ni necesite validar el JWT. Ninguna tiene `app-attestation`
@@ -53,6 +56,7 @@ de `/notifications/tokens` no tienen body relevante.
 | Rate limiting por usuario en `/alerts/inbox` (20/min sobre `X-User-Id`) | ✅ |
 | Ruteo y rate limiting por usuario en `/alerts/sent` (20/min) y `PUT /alerts/{uuid}/seen` (30/min), US-09 | ✅ |
 | Ruteo, límite de tamaño (1 KB) y rate limiting por usuario (3/min, 10/hora) en `DELETE /users/me`, US-11 | ✅ |
+| Ruteo, atestación, límite de tamaño y rate limiting por IP en `/auth/email-verifications`, `/auth/password-resets` y sus subrecursos (5 Routes de path exacto), US-13 | ✅ |
 | Rate limiting por usuario en el alta de `/notifications/tokens` (10/día sobre `X-User-Id`) | ✅ |
 | La baja de `/notifications/tokens` sin rate limiting (deliberado, ver más abajo) | ✅ |
 | Atestación real contra Google Play Integrity | ✅ |
@@ -63,7 +67,7 @@ de `/notifications/tokens` no tienen body relevante.
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | `/admin/*` de Benefits sin Route en Kong (verificado con un 404 explícito, con y sin `X-Admin-Api-Key`) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 411 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
+| CI: 104 tests unitarios + 480 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
 
 ## Estructura
 
@@ -766,6 +770,45 @@ Gateway sólo perimetra el endpoint y reenvía la respuesta sin tocarla.
 - **El Gateway no loguea la contraseña.** El access log de Kong no incluye
   bodies.
 
+## Verificación de email y recuperación de contraseña (US-13)
+
+Cinco Routes más sobre `identity-service`, todas `POST`, públicas (sin `jwt`: el
+usuario todavía no tiene sesión o la perdió) y con el mismo perímetro que signup
+y signin. Los bodies son el sobre HPKE vigente (`{ "ephemeral_public_key",
+"ciphertext" }`): el Gateway no los inspecciona ni los transforma, sólo los
+reenvía. Los códigos, los tokens y las respuestas son de Identity.
+
+| Route | Path | Body máximo | Rate limit por IP |
+|---|---|---|---|
+| `identity-email-verifications` | `POST /api/v1/auth/email-verifications` | `SIGNIN_MAX_BODY_KB` | 3/min, 10/hora |
+| `identity-email-verifications-confirm` | `POST /api/v1/auth/email-verifications/confirm` | `SIGNIN_MAX_BODY_KB` | 10/min, 30/hora |
+| `identity-password-resets` | `POST /api/v1/auth/password-resets` | `SIGNIN_MAX_BODY_KB` | 3/min, 10/hora |
+| `identity-password-resets-confirm` | `POST /api/v1/auth/password-resets/confirm` | `SIGNIN_MAX_BODY_KB` | 10/min, 30/hora |
+| `identity-password-resets-complete` | `POST /api/v1/auth/password-resets/complete` | `SIGNUP_MAX_BODY_MB` (lleva la selfie) | 3/min, 10/hora |
+
+- **Path exacto en las cinco** (`~/api/v1/auth/...$`, regla de US-08). Comparten
+  prefijo entre sí: un path de prefijo en `email-verifications` o
+  `password-resets` capturaría `/confirm` y `/complete` con el cupo y el techo
+  del padre.
+- **Sin `jwt`, con `request-transformer`.** Como no hay `token-offloading`, cada
+  Route descarta los `X-User-Hash` y `X-User-Id` que mande el cliente, igual que
+  signup y signin.
+- **Con `app-attestation`**, con el mismo bloque de configuración que signup y
+  signin. El `rate-limiting` (prioridad 910) corre antes que la atestación
+  (900): una ráfaga que ya superó el cupo recibe `429` sin gastar una llamada a
+  Google.
+- **Rate limit por IP, porque no hay otra clave.** Son endpoints sin sesión, así
+  que el cupo es por IP de cliente y se suma al límite global. Detrás de un
+  balanceador hace falta `KONG_TRUSTED_IPS` (ver "Rate limiting detrás de un
+  proxy"); en AWS queda para esa etapa. Los cupos de `confirm` son más altos
+  porque el usuario puede equivocarse al tipear el código; el límite de intentos
+  por código lo aplica Identity.
+- **Timeouts:** los del `identity-service`, los mismos de signin y signup (ver
+  "Presupuesto de latencia").
+- **Anti-enumeración:** el Gateway no distingue casos. Los `202` idénticos
+  existan o no la cuenta son de Identity; el Gateway sólo agrega los suyos
+  (`403` de atestación, `413`, `429`).
+
 ## Registro y Baja de Tokens FCM: `/notifications/tokens` (US-06)
 
 Dos Routes sobre el mismo Service `notification-service`, separadas por
@@ -820,7 +863,7 @@ dos tienen que estar coordinadas:
 | Capa | Dónde | Qué hace |
 |---|---|---|
 | Piso global de nginx | `nginx_http_client_max_body_size` en `kong.conf` (no templado por entorno) | Corta con un `413` propio de nginx antes de que la request llegue a ningún plugin de Kong |
-| Techo por Route | plugin `request-size-limiting` en `kong.yml`, `SIGNUP_MAX_BODY_MB` en `/auth/signup`, `SIGNIN_MAX_BODY_KB` en `/auth/signin` | Corta con la respuesta estándar de Kong, sólo en su propia Route |
+| Techo por Route | plugin `request-size-limiting` en `kong.yml`, `SIGNUP_MAX_BODY_MB` en `/auth/signup` y `/auth/password-resets/complete`, `SIGNIN_MAX_BODY_KB` en `/auth/signin` y en las otras cuatro rutas de US-13 | Corta con la respuesta estándar de Kong, sólo en su propia Route |
 
 El plugin corre en prioridad 951 — antes que `rate-limiting` (910) y
 `app-attestation` (900), así que un body por encima del techo de su Route se
@@ -878,9 +921,10 @@ capas distintas, según si la Route tiene `token-offloading` o no:
   hace `clear_header` del header antes de escribir el suyo, en un único
   `access()` atómico — no hace falta ni conviene sumar otro plugin encima.
 - **Sin `token-offloading`** (`/auth/signup`, `/auth/signin`,
-  `/auth/refresh`, `/auth/logout`): cada una de esas cuatro Routes declara su
-  propia instancia de `request-transformer` que descarta ambos headers
-  entrantes.
+  `/auth/refresh`, `/auth/logout` y, desde US-13, las cinco rutas de
+  `/auth/email-verifications` y `/auth/password-resets`): cada una de esas
+  Routes declara su propia instancia de `request-transformer` que descarta ambos
+  headers entrantes.
 
 Antes había una única instancia de `request-transformer` **global**, que
 cubría las cuatro rutas sin `token-offloading` con una sola declaración. Se
@@ -899,7 +943,7 @@ Rutas con token-offloading (/users/me, /vehicles y, desde US-05/US-06/US-07/US-1
 /alerts, /alerts/inbox, /notifications/tokens y DELETE /users/me):
   jwt (1450) → token-offloading (1000) → rate-limiting (910, todas salvo DELETE /notifications/tokens)
 
-Rutas sin token-offloading (signup, signin, refresh, logout):
+Rutas sin token-offloading (signup, signin, refresh, logout y las cinco de US-13):
   rate-limiting (910) → app-attestation (900, salvo logout) → request-transformer (801, por Route)
 ```
 
@@ -973,7 +1017,7 @@ integración, ver "Resiliencia (K2)").
 | `benefits-service` | 1000 | 9000 | 9000 | 11000 |
 
 `identity-service` queda más ajustado porque sus Routes (`/auth/signup`,
-`/auth/signin`, `/auth/refresh`) además cargan `app-attestation`, que reparte
+`/auth/signin`, `/auth/refresh` y las cinco de US-13) además cargan `app-attestation`, que reparte
 el resto del presupuesto (hasta 4000ms) contra Google: `8000 + 4000 = 12000`.
 Las otras Routes no tienen esa dependencia y usan el presupuesto completo.
 

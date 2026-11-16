@@ -418,6 +418,265 @@ services:
                   - X-User-Hash
                   - X-User-Id
 
+      # ── US-13 — Verificación de email y recuperación de contraseña ───────
+      # Cinco Routes públicas, sin `jwt` (el usuario todavía no tiene sesión o
+      # la perdió), con el mismo perímetro que signup/signin: descarte de
+      # `X-User-Hash`/`X-User-Id`, `app-attestation` y un techo de body por
+      # Route. Los bodies son sobres HPKE: el Gateway no los inspecciona, sólo
+      # los reenvía. Los timeouts son los del `identity-service` (los mismos de
+      # signin/signup).
+      #
+      # Paths EXACTOS (regla del repo, US-08): `email-verifications` y
+      # `password-resets` comparten prefijo con sus subrecursos `/confirm` y
+      # `/complete`; un path de prefijo capturaría el subrecurso con el rate
+      # limit y el techo de body del padre.
+      #
+      # `rate-limiting` por Route con `limit_by: ip`: son endpoints sin sesión,
+      # así que la IP es la única clave posible. Corre en prioridad 910, antes
+      # que `app-attestation` (900), para que el abuso no gaste llamadas a
+      # Google. Se suma al límite global por IP (el más bajo de los dos corta
+      # primero). En AWS, el límite por IP necesita `KONG_TRUSTED_IPS` con el
+      # CIDR del balanceador; queda para esa etapa.
+      - name: identity-email-verifications
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/auth/email-verifications$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNIN_MAX_BODY_KB}
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 3
+              hour: 10
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
+
+      - name: identity-email-verifications-confirm
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/auth/email-verifications/confirm$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNIN_MAX_BODY_KB}
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 10
+              hour: 30
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
+
+      - name: identity-password-resets
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/auth/password-resets$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNIN_MAX_BODY_KB}
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 3
+              hour: 10
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
+
+      - name: identity-password-resets-confirm
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/auth/password-resets/confirm$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNIN_MAX_BODY_KB}
+              size_unit: kilobytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 10
+              hour: 30
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
+
+      - name: identity-password-resets-complete
+        methods:
+          - POST
+        paths:
+          - ~/api/v1/auth/password-resets/complete$
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+          - https
+        plugins:
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: ${SIGNUP_MAX_BODY_MB}
+              size_unit: megabytes
+              require_content_length: false
+          - name: rate-limiting
+            config:
+              minute: 3
+              hour: 10
+              limit_by: ip
+              policy: local
+              fault_tolerant: true
+              hide_client_headers: false
+              error_code: 429
+              error_message: "API rate limit exceeded"
+          - name: request-transformer
+            config:
+              remove:
+                headers:
+                  - X-User-Hash
+                  - X-User-Id
+          - name: app-attestation
+            config:
+              source: ${ATTESTATION_SOURCE}
+              package_name: ${PLAY_PACKAGE_NAME}
+              service_account_path: ${GOOGLE_SERVICE_ACCOUNT_PATH}
+              playintegrity_url: ${PLAY_INTEGRITY_URL}
+              ssl_verify: ${ATTESTATION_SSL_VERIFY}
+              # Sólo se usa con source = mock (CI y desarrollo aislado).
+              psk: "${APP_ATTESTATION_PSK}"
+              accepted_app_verdicts: ${ATTESTATION_APP_VERDICTS}
+              accepted_device_verdicts: ${ATTESTATION_DEVICE_VERDICTS}
+              max_age_seconds: ${ATTESTATION_MAX_AGE_SECONDS}
+              request_hash_encoding: ${ATTESTATION_REQUEST_HASH_ENCODING}
+              dependency_timeout_ms: ${ATTESTATION_DEPENDENCY_TIMEOUT_MS}
+              dependency_call_timeout_ms: ${ATTESTATION_DEPENDENCY_CALL_TIMEOUT_MS}
+
       # ── Scaffolding de Token Offloading ──────────────────────────────────
       # Ruta de ejemplo de un endpoint con sesión, para dejar el patrón
       # armado: no aplica a US-01/US-02/US-03 (signup, signin, refresh y
