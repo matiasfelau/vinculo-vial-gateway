@@ -339,4 +339,56 @@ describe("política de atestación", function()
       assert.equals("missing_account_details", reason)
     end)
   end)
+
+  describe("tolerancia a formas inesperadas", function()
+    it("acepta un veredicto de dispositivo informado como string suelto", function()
+      assert.is_true(evaluate({
+        deviceIntegrity = { deviceRecognitionVerdict = "MEETS_DEVICE_INTEGRITY" },
+      }))
+    end)
+
+    it("rechaza un veredicto de dispositivo de un tipo que no es lista ni string", function()
+      local ok, reason = evaluate({ deviceIntegrity = { deviceRecognitionVerdict = 42 } })
+
+      assert.is_nil(ok)
+      assert.equals("device_verdict_rejected", reason)
+    end)
+
+    it("informa 'ausente' en el detalle si el veredicto de app no vino", function()
+      local ok, reason, detail = evaluate({
+        appIntegrity = { appRecognitionVerdict = NONE },
+      })
+
+      assert.is_nil(ok)
+      assert.equals("app_verdict_rejected", reason)
+      assert.matches("recibido=ausente", detail)
+    end)
+
+    it("recorta los valores largos del detalle que va al log", function()
+      local ok, reason, detail = evaluate({
+        appIntegrity = { appRecognitionVerdict = string.rep("A", 500) },
+      })
+
+      assert.is_nil(ok)
+      assert.equals("app_verdict_rejected", reason)
+      assert.is_true(#detail < 300)
+      assert.matches("…", detail)
+    end)
+
+    it("sanea los saltos de línea del detalle: no se puede falsificar una entrada de log", function()
+      local ok, _, detail = evaluate({
+        appIntegrity = { appRecognitionVerdict = "A\nERROR falso" },
+      })
+
+      assert.is_nil(ok)
+      assert.is_nil(detail:find("\n", 1, true))
+    end)
+
+    it("rechaza un veredicto que no es una tabla", function()
+      local ok, reason = verdict_policy.evaluate("texto", config(), nil, NOW)
+
+      assert.is_nil(ok)
+      assert.equals("malformed_verdict", reason)
+    end)
+  end)
 end)

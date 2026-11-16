@@ -18,6 +18,11 @@ ancho no coincide con el de una línea medida.
 
 Uso:
     luacov_to_cobertura.py REPORTE.out SALIDA.xml [--markdown RESUMEN.md]
+                           [--fail-under PORCENTAJE]
+
+Con `--fail-under` el programa escribe igual todos los archivos de salida y
+termina con código 1 si la cobertura total queda por debajo del porcentaje:
+es el gate sobre el total del CI.
 """
 from __future__ import annotations
 
@@ -160,10 +165,17 @@ def to_cobertura(files: list[FileCoverage], timestamp: int = 0) -> ET.ElementTre
     return ET.ElementTree(root)
 
 
+def total_percent(files: list[FileCoverage]) -> float:
+    """Cobertura total en %, sobre todas las líneas ejecutables de todos los archivos."""
+    valid = sum(f.valid for f in files)
+    covered = sum(f.covered for f in files)
+    return 100.0 * covered / valid if valid else 100.0
+
+
 def markdown_summary(files: list[FileCoverage]) -> str:
     valid = sum(f.valid for f in files)
     covered = sum(f.covered for f in files)
-    total = 100.0 * covered / valid if valid else 100.0
+    total = total_percent(files)
     rows = [
         f"**Cobertura total (plugins Lua): {total:.2f} %** ({covered} de {valid} líneas)",
         "",
@@ -180,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("report")
     parser.add_argument("output")
     parser.add_argument("--markdown", help="además escribe un resumen en Markdown")
+    parser.add_argument(
+        "--fail-under",
+        type=float,
+        metavar="PORCENTAJE",
+        help="termina con código 1 si la cobertura total es menor a este porcentaje",
+    )
     args = parser.parse_args(argv)
     # El resumen lleva tildes: en consolas que no son UTF-8 (Windows) no debe romper.
     sys.stdout.reconfigure(encoding="utf-8")
@@ -197,6 +215,16 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.markdown, "w", encoding="utf-8") as fh:
             fh.write(summary)
     print(summary)
+
+    if args.fail_under is not None:
+        total = total_percent(files)
+        if total < args.fail_under:
+            print(
+                f"La cobertura total ({total:.2f} %) es menor al mínimo exigido "
+                f"({args.fail_under:g} %).",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

@@ -1,4 +1,5 @@
 local errors = require "vv.errors"
+local fake_kong = require "spec.helpers.fake_kong"
 
 -- Motivos internos que los plugins pueden producir. Ninguno debe filtrarse a
 -- la respuesta: son la señal que le diría a un atacante qué control tocó.
@@ -78,5 +79,42 @@ describe("contrato de error del Gateway", function()
 
   it("el contrato es cerrado: un motivo desconocido no produce respuesta", function()
     assert.is_nil(errors.build("motivo_inventado"))
+  end)
+
+  describe("exit", function()
+    local fake
+
+    before_each(function()
+      fake = fake_kong.install()
+    end)
+
+    after_each(function()
+      fake.restore()
+    end)
+
+    it("corta la request con el status y el body del contrato, como JSON", function()
+      errors.exit(errors.DEPENDENCY_UNAVAILABLE, "detalle interno")
+
+      local exit = fake.last_exit()
+      assert.equals(503, exit.status)
+      assert.same({ error = "service_unavailable", reason = "dependency_unavailable" }, exit.body)
+      assert.equals("application/json; charset=utf-8", exit.headers["Content-Type"])
+    end)
+
+    it("manda el detalle interno al log y no a la respuesta", function()
+      errors.exit(errors.INVALID_ATTESTATION, "motivo-interno-secreto")
+
+      assert.same({ "motivo-interno-secreto" }, fake.warns)
+      for _, value in pairs(fake.last_exit().body) do
+        assert.is_nil(tostring(value):find("motivo-interno-secreto", 1, true))
+      end
+    end)
+
+    it("no escribe al log si no hay detalle", function()
+      errors.exit(errors.INVALID_TOKEN)
+
+      assert.same({}, fake.warns)
+      assert.equals(401, fake.last_exit().status)
+    end)
   end)
 end)

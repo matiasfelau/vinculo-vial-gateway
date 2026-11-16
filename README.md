@@ -67,7 +67,7 @@ de `/notifications/tokens` no tienen body relevante.
 | `/internal/*` sin Route en Kong (verificado con un 404 explícito, Vehicle, Alert y Notification) | ✅ |
 | `/admin/*` de Benefits sin Route en Kong (verificado con un 404 explícito, con y sin `X-Admin-Api-Key`) | ✅ |
 | Imagen Docker + compose | ✅ |
-| CI: 104 tests unitarios + 480 verificaciones de integración + 15 del convertidor de cobertura, con cobertura, diff-cover, Trivy y Semgrep | ✅ |
+| CI: 231 tests unitarios + 480 verificaciones de integración + 21 del convertidor de cobertura, con cobertura, gate sobre el total (85 %), diff-cover, Trivy y Semgrep | ✅ |
 
 ## Estructura
 
@@ -89,6 +89,7 @@ kong/
 docker/entrypoint.sh              # renderiza kong.yml contra el entorno
 secrets/                          # credenciales montadas — no se versiona
 spec/                             # tests Busted
+spec/helpers/fake_kong.lua        # `kong` (PDK) y shared dict falsos para testear los handlers
 spec/coverage.sh                  # Busted con LuaCov, deja el reporte en coverage/
 spec/integration/run.sh           # integración contra un stub de Google
 ci/                               # convertidor LuaCov -> Cobertura XML y sus pruebas
@@ -223,7 +224,7 @@ bash spec/integration/run.sh
 
 | Job | Qué hace | ¿Corta? |
 |---|---|---|
-| `busted` | Specs con cobertura (LuaCov), reporte Cobertura XML, cobertura total en el resumen, diff-cover | Sí: spec rojo, o líneas nuevas con menos de 85 % |
+| `busted` | Specs con cobertura (LuaCov), reporte Cobertura XML, cobertura total en el resumen, gate sobre el total y diff-cover | Sí: spec rojo, cobertura total por debajo de 85 %, o líneas nuevas con menos de 85 % |
 | `config` | Que Kong arranque `healthy` con los plugins propios | Sí |
 | `integration` | Suite de integración contra el stub de Google | Sí |
 | `security` | Trivy (`vuln`, `secret`, `misconfig`; HIGH y CRITICAL con corrección disponible) y Semgrep (`p/default`) | Trivy sí; Semgrep no, es informativo |
@@ -259,6 +260,24 @@ código escrito a mano y el repo no tiene código generado.
 corre el Gateway real dentro de Docker y no se mide con LuaCov, así que no suma
 al reporte.
 
+**Cobertura actual: 99,0 %** (709 de 716 líneas; antes de `chore/cobertura-85`
+era 69,3 %). Los handlers corren sin levantar Kong: los specs reemplazan sólo la
+frontera con el PDK (`kong.request`, `kong.response.exit`, `kong.log`) y el
+shared dict por los fakes de `spec/helpers/fake_kong.lua`; la criptografía, la
+política y los schemas corren reales (los schemas se validan con la clase
+`Schema` de Kong, la misma que usa `kong config parse`).
+
+### Gate sobre el total
+
+```bash
+python ci/luacov_to_cobertura.py coverage/luacov.report.out coverage/cobertura.xml --fail-under 85
+```
+
+`--fail-under` escribe igual el XML y el resumen y termina con código 1 si la
+cobertura total (sobre todas las líneas ejecutables, no el promedio por archivo)
+queda por debajo del porcentaje. El job `busted` lo corre en todo PR y en todo
+`push` a `dev` y `main`: ninguna rama puede bajar el total de 85 %.
+
 ### diff-cover: el gate sobre el código nuevo
 
 ```bash
@@ -270,8 +289,8 @@ diff-cover coverage/cobertura.xml --compare-branch=origin/dev --fail-under=85
 El job usa `origin/<rama base del PR>`. Un PR que agrega una función Lua sin
 specs baja de 85 % sobre sus líneas nuevas y falla; al sumarle specs pasa. Un PR
 que no toca Lua no tiene líneas medibles y pasa. La cobertura total se publica
-en el resumen del job y como artefacto `cobertura-lua`, sin cortar: el gate
-sobre el total llega cuando el repo esté en 85 % o más.
+en el resumen del job y como artefacto `cobertura-lua`, y la corta el gate sobre
+el total (ver arriba).
 
 ### Escaneos en local
 
