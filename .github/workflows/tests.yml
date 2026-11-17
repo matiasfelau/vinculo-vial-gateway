@@ -29,7 +29,7 @@ jobs:
     steps:
       # El historial completo hace falta para que diff-cover pueda comparar
       # contra la rama base del PR.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -103,7 +103,7 @@ jobs:
     name: Configuración declarativa
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Construir la imagen del Gateway
         run: docker build -t vinculo-vial-gateway:ci .
@@ -147,7 +147,7 @@ jobs:
     name: Integración (Play Integrity contra stub)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Ejercita el camino HTTP completo contra Google —firma de la aserción
       # del service account, canje por access token, decodeIntegrityToken— que
@@ -160,7 +160,7 @@ jobs:
     name: Seguridad (Trivy y Semgrep)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Gate: falla ante HIGH o CRITICAL con corrección disponible. Las
       # excepciones viven solo en `.trivyignore`, con motivo y fecha de revisión.
