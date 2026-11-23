@@ -71,4 +71,47 @@ describe("hash del body", function()
       assert.equals("missing_body", reason)
     end)
   end)
+
+  describe("fallas de OpenSSL", function()
+    local openssl_digest = require "resty.openssl.digest"
+    local original_new
+
+    before_each(function()
+      original_new = openssl_digest.new
+    end)
+
+    after_each(function()
+      openssl_digest.new = original_new
+    end)
+
+    it("falla cerrado si no se puede crear el digest", function()
+      openssl_digest.new = function() return nil, "sin sha256" end
+
+      local hash, reason = request_hash.compute("body", "hex")
+      assert.is_nil(hash)
+      assert.equals("digest_error: sin sha256", reason)
+    end)
+
+    it("falla cerrado si el digest no procesa el body", function()
+      openssl_digest.new = function()
+        return { update = function() return nil, "memoria" end }
+      end
+
+      local hash, reason = request_hash.compute("body", "hex")
+      assert.is_nil(hash)
+      assert.equals("digest_error: memoria", reason)
+    end)
+  end)
+
+  describe("comparación ante errores", function()
+    it("no acepta nada si no se puede calcular el hash esperado", function()
+      local matches, reason = request_hash.matches("cualquier-cosa", "body", "rot13")
+      assert.is_nil(matches)
+      assert.equals("unsupported_encoding", reason)
+
+      matches, reason = request_hash.matches("cualquier-cosa", nil, "hex")
+      assert.is_nil(matches)
+      assert.equals("missing_body", reason)
+    end)
+  end)
 end)
